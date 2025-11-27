@@ -1,0 +1,12 @@
+wandb
+transformers
+tqdm
+torchcontrib
+torchstat
+soundfile
+scikit-learn
+opencv-python
+opensmile==2.5.0
+numpy
+librosa==0.10.0
+speechbrain

@@ -1,0 +1,24 @@
+# 忽略 Python 缓存
+__pycache__/
+*.py[cod]
+
+# 忽略大数据集 (根据你的目录结构)
+datasets/
+data/
+
+# 忽略训练产生的模型权重和日志
+savefile/
+checkpoints/
+*.pt
+*.pth
+wandb/
+results/
+
+# 忽略编译产生的垃圾文件 (你之前编译 Mamba 产生的)
+build/
+dist/
+*.egg-info/
+
+# 忽略 IDE 配置
+.vscode/
+.idea/
