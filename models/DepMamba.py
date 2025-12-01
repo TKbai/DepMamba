@@ -1,7 +1,7 @@
-"""DepMamba implementation.
+"""ES-DepMamba implementation.
 Authors
 -------
-* Jiaxin Ye 2024
+* Yaxin Bai 2025
 """
 
 import warnings
@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+from .evidence_selector import EvidenceSelector
 
 # ---- torchaudio 兼容：新版本没有 list_audio_backends ----
 if not hasattr(torchaudio, "list_audio_backends"):
@@ -399,6 +400,18 @@ class DepMamba(BaseNet):
 
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
+        # ===== ES-Mamba: 新增，音频 Evidence Selector（当前只计算，不参与决策） =====
+        # xa 在 Conv 之后的形状是 (B, L, mm_input_size)，Selector 期望 (B, D, L)
+        selector_tau = 1.0   # 先写死，后面可以放到 config 里
+        self.audio_selector = EvidenceSelector(
+            d_in=mm_input_size,
+            d_hidden=mm_input_size,
+            tau=selector_tau,
+            hard=False,        # 当前阶段只用 soft gate
+        )
+        # 用于在训练循环里取 gate（可选）
+        self.last_audio_gate = None
+        # =============================================================
         
 
     def feature_extractor(self, x, padding_mask=None, a_inference_params = None, v_inference_params = None):
@@ -406,7 +419,14 @@ class DepMamba(BaseNet):
         xv = x[:, :, :136]
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
+        # ===== ES-Mamba: 使用 Conv 后的音频特征做 Evidence Selection =====
+        # 当前 xa: (B, L, mm_input_size) -> 转成 (B, D, L) 喂给 Selector
+        xa_for_sel = xa.permute(0, 2, 1)           # (B, D, L)
+        gate_a, logits_a = self.audio_selector(xa_for_sel)  # gate_a: (B, 1, L)
 
+        # 先不把 gate 用到后续计算，只保存下来，后面加稀疏 loss / Mamba gating 时会用到
+        self.last_audio_gate = gate_a
+        # ===============================================================
         xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
 
         x = torch.cat([xa,xv],dim=-1)
