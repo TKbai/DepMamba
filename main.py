@@ -20,6 +20,7 @@ def setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False     # 禁止自动寻找最优算子
 
 def parse_args():
     with open(CONFIG_PATH, "r") as f:
@@ -72,7 +73,44 @@ def train_epoch(
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
             y_pred = net(x, mask)
             
-            loss = loss_fn(y_pred, y.to(torch.float32))
+            # 兼容 DataParallel 和 单卡两种情况
+            core_net = net.module if isinstance(net, torch.nn.DataParallel) else net
+            gate = getattr(core_net, "last_audio_gate", None)  # (B, 1, L) or None
+            if gate is not None:
+                g = gate
+                g_det = g.detach()# 不带梯度，用来打印统计
+                if (current_epoch % 2 == 0) and (random.random() < 0.1):
+                    keep_ratio = (g_det > 0.5).float().mean().item()
+                    print(
+                        "gate stats: mean={:.3f}, min={:.3f}, max={:.3f}, keep@0.5={:.3f}".format(
+                            g_det.mean().item(),
+                            g_det.min().item(),
+                            g_det.max().item(),
+                            keep_ratio,
+                        )
+                    )
+                loss_sparsity = g.mean()
+                diff = torch.abs(g[..., 1:] - g[..., :-1])
+                loss_continuity = diff.mean()
+            else:
+                loss_sparsity = torch.tensor(0.0, device=device)
+                loss_continuity = torch.tensor(0.0, device=device)
+
+            lambda_sparse = get_lambda_sparse(current_epoch)
+            lambda_cont   = get_lambda_cont(current_epoch)
+            loss_cls = loss_fn(y_pred, y.to(torch.float32))
+            loss_s_term = lambda_sparse * loss_sparsity
+            loss_c_term = lambda_cont * loss_continuity
+
+            if current_epoch % 2 == 0 and random.random() < 0.05:
+                print(
+                    f"[epoch {current_epoch}] "
+                    f"loss_cls={loss_cls.item():.3f}, "
+                    f"λ_s*Ls={loss_s_term.item():.3f}, "
+                    f"λ_c*Lc={loss_c_term.item():.3f}"
+                )
+
+            loss = loss_cls + loss_s_term + loss_c_term
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -157,6 +195,21 @@ def val(
         "precision": precision, "recall": recall, "f1": f1_score,
     }
 
+# ====== ES-Mamba: 稀疏 / 连续性正则的 warm-up 系数 ======
+def get_lambda_sparse(epoch: int) -> float:
+    if epoch < 5:
+        return 0.0
+    elif epoch < 20:
+        return 0.015 * (epoch - 4)   # 线性升到大约 0.08
+    else:
+        return 0.20
+
+def get_lambda_cont(epoch: int) -> float:
+    if epoch < 3:
+        return 0.0
+    else:
+        return 0.02
+# ========================================================
 
 def main():
     args = parse_args()
@@ -268,5 +321,5 @@ def main():
 
 
 if __name__ == '__main__':
-    setup_seed(4555)
+    setup_seed(2000)
     main()
