@@ -427,6 +427,13 @@ class DepMamba(BaseNet):
         # 先不把 gate 用到后续计算，只保存下来，后面加稀疏 loss / Mamba gating 时会用到
         self.last_audio_gate = gate_a
         # ===============================================================
+
+        # ===== ESMamba-input：用 gate 先做一次输入级 Mask =====
+        # xa: (B, L, D), gate_a: (B, 1, L) -> (B, L, 1)
+        gate_a_t = gate_a.permute(0, 2, 1)         # (B, L, 1)
+        xa = xa * gate_a_t                         # 广播到 D 维
+        # ======================================================
+        
         xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
 
         x = torch.cat([xa,xv],dim=-1)
