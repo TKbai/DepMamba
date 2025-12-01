@@ -268,5 +268,5 @@ def main():
 
 
 if __name__ == '__main__':
-    setup_seed(1111)
+    setup_seed(4555)
     main()
