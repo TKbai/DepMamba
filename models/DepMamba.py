@@ -55,6 +55,7 @@ from mamba_ssm import Mamba
 from .es_mamba import Mamba as ESMamba 
 from .mamba.bimamba import Mamba as BiMamba
 from .mamba.mm_bimamba import Mamba as MMBiMamba
+from .mamba.es_mm_bimamba import ESMMBiMamba 
 from .base import BaseNet
 
 
@@ -86,7 +87,7 @@ class MMMambaEncoderLayer(nn.Module):
                 **mamba_config
             )
         else:
-            self.mamba = MMBiMamba(
+            self.mamba = ESMMBiMamba(
                 d_model=d_model,
                 bimamba_type='v2',
                 **mamba_config
@@ -104,12 +105,13 @@ class MMMambaEncoderLayer(nn.Module):
 
     def forward(
         self,
-        a_x, v_x, 
+        a_x, v_x,
+        gate=None, 
         a_inference_params = None,
         v_inference_params = None
     ):
         
-        a_out1, v_out1 = self.mamba(a_x, v_x,a_inference_params,v_inference_params)
+        a_out1, v_out1 = self.mamba(a_x, v_x,a_inference_params,v_inference_params,gate=gate)
         a_out = a_x + self.norm1(a_out1)
         v_out = v_x + self.norm2(v_out1)
 
@@ -313,7 +315,8 @@ class CoSSM(nn.Module):
 
     def forward(
         self,
-        a_x, v_x, 
+        a_x, v_x,
+        gate=None, 
         a_inference_params = None,
         v_inference_params = None
     ):
@@ -326,6 +329,7 @@ class CoSSM(nn.Module):
             v_out = v_out.permute(0,2,1)
             a_out, v_out = mamba_layer(
                 a_out, v_out,
+                gate=gate, 
                 a_inference_params = a_inference_params,
                 v_inference_params = v_inference_params
             )
@@ -458,12 +462,18 @@ class DepMamba(BaseNet):
         xa = xa * gate_a_t                         # 广播到 D 维
         # ======================================================
         
-        xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
+        xa, xv = self.cossm_encoder(
+            xa,
+            xv,
+            gate=self.last_audio_gate,             # ★ 传给 CoSSM / ES-BiMamba
+            a_inference_params=a_inference_params,
+            v_inference_params=v_inference_params,
+        )
 
         x = torch.cat([xa,xv],dim=-1)
         x = self.enssm_encoder(
             x,
-            gate=self.last_audio_gate,   # 或者 gate=gate_a，等价
+            gate=self.last_audio_gate,   
             inference_params=None,
         )
         
