@@ -142,7 +142,7 @@ class Mamba(nn.Module):
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
-        if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
+        if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None and gate is None :  # Doesn't support outputting the states
             out = mamba_inner_fn(
                 xz,
                 self.conv1d.weight,
@@ -183,6 +183,20 @@ class Mamba(nn.Module):
             dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
             dt = self.dt_proj.weight @ dt.t()
             dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
+            # ====== ES-Mamba: 用 gate 调制时间步长 Δ ======
+            if gate is not None:
+                # 期望 gate 形状是 (B, 1, L)
+                if gate.dim() == 2:            # (B, L) -> (B, 1, L)
+                    gate_ = gate.unsqueeze(1)
+                elif gate.dim() == 3 and gate.size(1) == 1:
+                    gate_ = gate              # 已经是 (B, 1, L)
+                else:
+                    # 兜底：强行 reshape 成 (B, 1, L)
+                    gate_ = gate.view(batch, 1, seqlen)
+
+                # 利用 broadcast： (B, d_inner, L) * (B, 1, L)
+                dt = dt * gate_
+            # ===========================================
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]

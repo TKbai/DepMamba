@@ -51,7 +51,8 @@ if not hasattr(_pytree, "register_pytree_node") and hasattr(_pytree, "_register_
 
     _pytree.register_pytree_node = _patched_register_pytree_node
 
-from mamba_ssm import Mamba
+from mamba_ssm import Mamba  
+from .es_mamba import Mamba as ESMamba 
 from .mamba.bimamba import Mamba as BiMamba
 from .mamba.mm_bimamba import Mamba as MMBiMamba
 from .base import BaseNet
@@ -175,7 +176,7 @@ class MambaEncoderLayer(nn.Module):
         mamba_config=None
     ):
         super().__init__()
-        assert mamba_config != None
+        assert mamba_config is not None
 
         if activation == 'Swish':
             activation = Swish
@@ -184,29 +185,50 @@ class MambaEncoderLayer(nn.Module):
         else:
             activation = Swish
 
+        # 从 config 里拿出 bidirectional
         bidirectional = mamba_config.pop('bidirectional')
+
         if causal or (not bidirectional):
-            self.mamba = Mamba(
+            # ★ 单向：改成用你自己的 ESMamba（es_mamba 里那个）
+            self.mamba = ESMamba(
                 d_model=d_model,
                 **mamba_config
             )
         else:
+            # ★ 双向：仍然用原来的 BiMamba，不支持 gate
             self.mamba = BiMamba(
                 d_model=d_model,
                 bimamba_type='v2',
                 **mamba_config
             )
+
+        # 用完再放回去，防止外面复用 mamba_config 时出问题
         mamba_config['bidirectional'] = bidirectional
 
         self.norm1 = LayerNorm(d_model, eps=1e-6)
         self.drop = nn.Dropout(dropout)
 
-
     def forward(
         self,
-        x, inference_params = None
+        x,
+        inference_params=None,
+        gate=None,   # 暂时没人传，默认 None
     ):
-        out = x + self.norm1(self.mamba(x, inference_params))
+        # 只有 ESMamba 才支持 gate 这个 keyword
+        if isinstance(self.mamba, ESMamba):
+            core_out = self.mamba(
+                x,
+                gate=gate,
+                inference_params=inference_params,
+            )
+        else:
+            # BiMamba / 原 Mamba：忽略 gate，只按老接口调用
+            core_out = self.mamba(
+                x,
+                inference_params,
+            )
+
+        out = x + self.norm1(core_out)
         return out
 
 class CNNEncoderLayer(nn.Module):
@@ -353,6 +375,7 @@ class EnSSM(nn.Module):
     def forward(
         self,
         x,
+        gate=None,
         inference_params = None,
     ):
         out = x
@@ -363,6 +386,7 @@ class EnSSM(nn.Module):
             out = mamba_layer(
                 out,
                 inference_params = inference_params,
+                gate=gate, 
             )
 
         return out
@@ -437,7 +461,11 @@ class DepMamba(BaseNet):
         xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
 
         x = torch.cat([xa,xv],dim=-1)
-        x = self.enssm_encoder(x)
+        x = self.enssm_encoder(
+            x,
+            gate=self.last_audio_gate,   # 或者 gate=gate_a，等价
+            inference_params=None,
+        )
         
         if padding_mask is not None:
             x = x * (padding_mask.unsqueeze(-1).float())
