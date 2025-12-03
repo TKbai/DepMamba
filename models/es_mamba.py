@@ -43,7 +43,7 @@ class Mamba(nn.Module):
         dt_init_floor=1e-4,
         conv_bias=True,
         bias=False,
-        use_fast_path=True,  # Fused kernel options
+        use_fast_path=False,  # Fused kernel options
         layer_idx=None,
         device=None,
         dtype=None,
@@ -183,20 +183,22 @@ class Mamba(nn.Module):
             dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
             dt = self.dt_proj.weight @ dt.t()
             dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
-            # ====== ES-Mamba: 用 gate 调制时间步长 Δ ======
+            # ===== ES-Mamba: 用 gate 调制时间步长 Δ（不回传梯度） =====
             if gate is not None:
-                # 期望 gate 形状是 (B, 1, L)
-                if gate.dim() == 2:            # (B, L) -> (B, 1, L)
-                    gate_ = gate.unsqueeze(1)
-                elif gate.dim() == 3 and gate.size(1) == 1:
-                    gate_ = gate              # 已经是 (B, 1, L)
-                else:
-                    # 兜底：强行 reshape 成 (B, 1, L)
-                    gate_ = gate.view(batch, 1, seqlen)
+                gate_det = gate.detach()         # 只让它控制步长，不让梯度回到 selector
 
-                # 利用 broadcast： (B, d_inner, L) * (B, 1, L)
-                dt = dt * gate_
-            # ===========================================
+                # 期望 gate 形状是 (B, 1, L)
+                if gate_det.dim() == 2:          # (B, L) -> (B, 1, L)
+                    gate_det = gate_det.unsqueeze(1)
+                elif gate_det.dim() == 3 and gate_det.size(1) == 1:
+                    pass                         # 已经是 (B, 1, L)
+                else:
+                    gate_det = gate_det.view(batch, 1, seqlen)
+
+                # 利用 broadcast: (B, d_inner, L) * (B, 1, L)
+                dt = dt * gate_det
+            # ===============================================
+            dt = torch.clamp(dt, min=-10.0, max=4.0)
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]

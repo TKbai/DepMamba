@@ -1,6 +1,8 @@
 import argparse
 import os
 import yaml
+import math
+import json
 
 import wandb
 import torch
@@ -13,6 +15,7 @@ from datasets import get_dvlog_dataloader, get_lmvd_dataloader
 
 
 CONFIG_PATH = "./config/config.yaml"
+
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -63,6 +66,37 @@ def train_epoch(
     sample_count = 0
     running_loss = 0.
     correct_count = 0
+ # --- 为画曲线准备的一些 epoch 级统计 ---
+    gate_a_sum = 0.0
+    gate_a_keep_sum = 0.0
+    gate_v_sum = 0.0
+    gate_v_keep_sum = 0.0
+    gate_count = 0
+
+    loss_s_sum = 0.0
+    loss_c_sum = 0.0
+
+
+
+
+    # ====== ES-Mamba: 控制 EvidenceSelector 的 tau / hard ======
+    core_net = net.module if isinstance(net, torch.nn.DataParallel) else net
+
+    # 1) soft->hard curriculum：前 30 个 epoch 一律 hard=False
+    hard_start_epoch = 30
+    use_hard = (current_epoch >= hard_start_epoch)
+
+    # 2) tau 退火：从 3.0 慢慢降到 0.5，别再往下了
+    tau0 = 3.0
+    tau_min = 0.5
+    tau_now = max(tau_min, tau0 * math.exp(-0.05 * current_epoch))
+
+    # 更新 audio selector
+    if hasattr(core_net, "audio_selector"):
+        core_net.audio_selector.hard = use_hard
+        core_net.audio_selector.tau = tau_now
+    # 如果以后还想给 video selector 也用 gumbel，可以类似处理
+    # =======================================================
 
     with tqdm(
         train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}",
@@ -75,26 +109,45 @@ def train_epoch(
             
             # 兼容 DataParallel 和 单卡两种情况
             core_net = net.module if isinstance(net, torch.nn.DataParallel) else net
-            gate = getattr(core_net, "last_audio_gate", None)  # (B, 1, L) or None
-            if gate is not None:
-                g = gate
-                g_det = g.detach()# 不带梯度，用来打印统计
+            gate_a = getattr(core_net, "last_audio_gate", None)   # (B, 1, L) or None
+            gate_v = getattr(core_net, "last_video_gate", None)   # (B, 1, L) or None
+            # ====== audio gate：打印 + 正则 ======
+            if gate_a is not None:
+                g = gate_a                           # 不 detach，用来算正则
+                g_det = g.detach()                   # 用来统计
+
+                # 每 2 个 epoch、10% 的 batch 打一次
                 if (current_epoch % 2 == 0) and (random.random() < 0.1):
                     keep_ratio = (g_det > 0.5).float().mean().item()
                     print(
-                        "gate stats: mean={:.3f}, min={:.3f}, max={:.3f}, keep@0.5={:.3f}".format(
+                        "[audio] gate stats: mean={:.3f}, min={:.3f}, max={:.3f}, keep@0.5={:.3f}".format(
                             g_det.mean().item(),
                             g_det.min().item(),
                             g_det.max().item(),
                             keep_ratio,
                         )
                     )
+
+                # 稀疏 + 连续性正则（目前只对 audio）
                 loss_sparsity = g.mean()
                 diff = torch.abs(g[..., 1:] - g[..., :-1])
                 loss_continuity = diff.mean()
             else:
                 loss_sparsity = torch.tensor(0.0, device=device)
                 loss_continuity = torch.tensor(0.0, device=device)
+
+            # ====== video gate：只打印，不进 loss ======
+            if gate_v is not None and (current_epoch % 2 == 0) and (random.random() < 0.1):
+                gv = gate_v.detach()
+                keep_ratio_v = (gv > 0.5).float().mean().item()
+                print(
+                    "[video] gate stats: mean={:.3f}, min={:.3f}, max={:.3f}, keep@0.5={:.3f}".format(
+                        gv.mean().item(),
+                        gv.min().item(),
+                        gv.max().item(),
+                        keep_ratio_v,
+                    )
+                )
 
             lambda_sparse = get_lambda_sparse(current_epoch)
             lambda_cont   = get_lambda_cont(current_epoch)
@@ -112,6 +165,22 @@ def train_epoch(
 
             loss = loss_cls + loss_s_term + loss_c_term
             loss.backward()
+# ------- 统计 gate / loss_s / loss_c 的 epoch 均值 -------
+            bsz = x.size(0)
+            if gate_a is not None:
+                g_det = gate_a.detach()
+                gate_a_sum += g_det.mean().item() * bsz
+                gate_a_keep_sum += (g_det > 0.5).float().mean().item() * bsz
+                loss_s_sum += loss_s_term.item() * bsz
+                loss_c_sum += loss_c_term.item() * bsz
+                gate_count += bsz
+
+            if gate_v is not None:
+                gv_det = gate_v.detach()
+                gate_v_sum += gv_det.mean().item() * bsz
+                gate_v_keep_sum += (gv_det > 0.5).float().mean().item() * bsz
+
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
 
@@ -126,9 +195,30 @@ def train_epoch(
                 "acc": correct_count / sample_count,
             })
 
+    epoch_loss = running_loss / sample_count
+    epoch_acc  = correct_count / sample_count
+
+    if gate_count > 0:
+        gate_a_mean = gate_a_sum / gate_count
+        gate_a_keep = gate_a_keep_sum / gate_count
+        gate_v_mean = gate_v_sum / gate_count
+        gate_v_keep = gate_v_keep_sum / gate_count
+        loss_s_avg  = loss_s_sum / gate_count
+        loss_c_avg  = loss_c_sum / gate_count
+    else:
+        gate_a_mean = gate_a_keep = 0.0
+        gate_v_mean = gate_v_keep = 0.0
+        loss_s_avg = loss_c_avg = 0.0
+
     return {
-        "loss": running_loss / sample_count,
-        "acc": correct_count / sample_count,
+        "loss": epoch_loss,
+        "acc": epoch_acc,
+        "gate_a_mean": gate_a_mean,
+        "gate_a_keep": gate_a_keep,
+        "gate_v_mean": gate_v_mean,
+        "gate_v_keep": gate_v_keep,
+        "loss_s": loss_s_avg,
+        "loss_c": loss_c_avg,
     }
 
 
@@ -197,24 +287,48 @@ def val(
 
 # ====== ES-Mamba: 稀疏 / 连续性正则的 warm-up 系数 ======
 def get_lambda_sparse(epoch: int) -> float:
-    if epoch < 5:
+    """
+    稀疏正则：前 30 epoch 不加，
+    30~90 线性升到 0.05，之后保持 0.05。
+    """
+    if epoch < 30:
         return 0.0
-    elif epoch < 20:
-        return 0.015 * (epoch - 4)   # 线性升到大约 0.08
+    elif epoch < 90:
+        # 30 -> 90 之间从 0 线性升到 0.05
+        return 0.05 * (epoch - 30) / 60.0
     else:
-        return 0.20
+        return 0.05
+
 
 def get_lambda_cont(epoch: int) -> float:
-    if epoch < 3:
+    """
+    连续性正则：力度再小一点，只做“平滑”，别主导训练。
+    """
+    if epoch < 30:
         return 0.0
     else:
-        return 0.02
+        return 0.01
 # ========================================================
 
 def main():
     args = parse_args()
     args.data_dir = os.path.join(args.data_dir,args.dataset)
     for i_iter in range(3):
+        history = {
+            "train_loss": [],
+            "train_acc": [],
+            "train_loss_s": [],
+            "train_loss_c": [],
+            "gate_a_mean": [],
+            "gate_a_keep": [],
+            "gate_v_mean": [],
+            "gate_v_keep": [],
+            "val_loss": [],
+            "val_acc": [],
+            "val_precision": [],
+            "val_recall": [],
+            "val_f1": [],
+        }
         if args.if_wandb:
             wandb_run_name = f"{args.model}-{args.train_gender}-{args.test_gender}"
             wandb.init(
@@ -274,6 +388,21 @@ def main():
                     args.device[0], epoch, args.epochs, args.tqdm_able
                 )
                 val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
+                 # ---- 记录曲线用的指标 ----
+                history["train_loss"].append(float(train_results["loss"]))
+                history["train_acc"].append(float(train_results["acc"]))
+                history["train_loss_s"].append(float(train_results["loss_s"]))
+                history["train_loss_c"].append(float(train_results["loss_c"]))
+                history["gate_a_mean"].append(float(train_results["gate_a_mean"]))
+                history["gate_a_keep"].append(float(train_results["gate_a_keep"]))
+                history["gate_v_mean"].append(float(train_results["gate_v_mean"]))
+                history["gate_v_keep"].append(float(train_results["gate_v_keep"]))
+
+                history["val_loss"].append(float(val_results["loss"]))
+                history["val_acc"].append(float(val_results["acc"]))
+                history["val_precision"].append(float(val_results["precision"]))
+                history["val_recall"].append(float(val_results["recall"]))
+                history["val_f1"].append(float(val_results["f1"]))
 
                 val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
                 if val_acc > best_val_acc:
@@ -295,16 +424,43 @@ def main():
         # load the best model for testing
         with torch.no_grad():
             net.load_state_dict(
-                torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=args.device[0])
+                torch.load(
+                    f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt",
+                    map_location=args.device[0],
+                )
             )
             net.eval()
-            test_results = val(net, test_loader, loss_fn, args.device[0],args.tqdm_able)
+            test_results = val(net, test_loader, loss_fn, args.device[0], args.tqdm_able)
             print("Test results:")
             print(test_results)
 
-            with open(f'./results/{args.dataset}_{args.model}_{str(i_iter)}.txt','w') as f:    
-                test_result_str = f'Accuracy:{test_results["acc"]}, Precision:{test_results["precision"]}, Recall:{test_results["recall"]}, F1:{test_results["f1"]}, Avg:{(test_results["acc"] + test_results["precision"]+ test_results["recall"]+ test_results["f1"])/4.0}'
-                f.write(test_result_str)         
+            # -------- 保存 test 结果到 txt --------
+            avg_score = (
+                test_results["acc"]
+                + test_results["precision"]
+                + test_results["recall"]
+                + test_results["f1"]
+            ) / 4.0
+
+            results_path = f'./results/{args.dataset}_{args.model}_{str(i_iter)}.txt'
+            os.makedirs(os.path.dirname(results_path), exist_ok=True)
+            with open(results_path, "w") as f:
+                test_result_str = (
+                    f'Accuracy:{test_results["acc"]}, '
+                    f'Precision:{test_results["precision"]}, '
+                    f'Recall:{test_results["recall"]}, '
+                    f'F1:{test_results["f1"]}, '
+                    f'Avg:{avg_score}'
+                )
+                f.write(test_result_str)
+
+            # -------- 保存本次 run 的曲线数据（放到当前 run 的目录里）--------
+            run_dir = f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}"
+            curve_path = os.path.join(run_dir, "curves.json")
+            with open(curve_path, "w") as f_json:
+                json.dump(history, f_json, indent=2)
+            print("Curve stats saved to:", curve_path, flush=True)
+
 
     if args.if_wandb:
         artifact = wandb.Artifact("best_model", type="model")

@@ -52,7 +52,7 @@ class ESMMBiMamba(nn.Module):
         dt_init_floor=1e-4,
         conv_bias=True,
         bias=False,
-        use_fast_path=True,  # Fused kernel options
+        use_fast_path=False,  # Fused kernel options
         layer_idx=None,
         device=None,
         dtype=None,
@@ -452,23 +452,31 @@ class ESMMBiMamba(nn.Module):
             v_dt = rearrange(v_dt, "d (b l) -> b d l", l=seqlen)
             v_B = rearrange(v_B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             v_C = rearrange(v_C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-            # ===== ES-BiMamba: 用音频 gate 控制音/视两条分支的 Δ =====
+
+            # ===== ES-BiMamba: 只对 audio 做 Δ-gating，且用 detach =====
             if gate is not None:
-                # gate 现在应该是 (B, 1, L)，来自 EvidenceSelector
+                # gate 理论上是 (B, 1, L) 或 (B, L)
                 if gate.dim() == 2:          # (B, L) -> (B, 1, L)
                     g = gate.unsqueeze(1)
-                else:                         # (B, 1, L)
+                elif gate.dim() == 3 and gate.size(1) == 1:
                     g = gate
+                else:
+                    # 兜底 reshape，一般不会进来
+                    g = gate.view(batch, 1, seqlen)
 
-                # 简单的 sanity check（也可以不要，但调 bug 很方便）
-                if g.shape[0] != a_dt.shape[0] or g.shape[-1] != a_dt.shape[-1]:
+                g_det = g.detach()  # master 停梯度，防止 selector 被 dt 反向拉爆
+
+                if g_det.shape[0] != a_dt.shape[0] or g_det.shape[-1] != a_dt.shape[-1]:
                     raise ValueError(
-                        f"gate shape {g.shape} not compatible with dt shape {a_dt.shape}"
+                        f"gate shape {g_det.shape} not compatible with a_dt shape {a_dt.shape}"
                     )
 
-                # 利用广播，让 gate 在通道维上扩展到 d_inner
-                a_dt = a_dt * g          # (B, d_inner, L) * (B, 1, L)
-                v_dt = v_dt * g
+                # 只有 audio 分支乘 gate；video 不乘 gate（只做输入级 mask）
+                a_dt = a_dt * g_det          # (B, d_inner, L) * (B, 1, L)
+
+            # ===== Mamba dt clamp：物理限幅，防止 dt 爆炸 =====
+            a_dt = torch.clamp(a_dt, min=-10.0, max=4.0)
+            v_dt = torch.clamp(v_dt, min=-10.0, max=4.0)
             # ==========================================================
 
             assert self.activation in ["silu", "swish"]

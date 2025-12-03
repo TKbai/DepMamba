@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-from .evidence_selector import EvidenceSelector
+from .evidence_selector import EvidenceSelector, VideoSelector
 
 # ---- torchaudio 兼容：新版本没有 list_audio_backends ----
 if not hasattr(torchaudio, "list_audio_backends"):
@@ -440,6 +440,15 @@ class DepMamba(BaseNet):
         # 用于在训练循环里取 gate（可选）
         self.last_audio_gate = None
         # =============================================================
+
+        # ===== ES-Mamba: 新增，视频 Slave Selector =====
+        # xv Conv 后同样是 (B, L, mm_input_size) -> (B, D, L)
+        self.video_selector = VideoSelector(
+            d_in=mm_input_size,
+            d_hidden=mm_input_size,
+        )
+        self.last_video_gate = None
+        # =============================================================
         
 
     def feature_extractor(self, x, padding_mask=None, a_inference_params = None, v_inference_params = None):
@@ -447,19 +456,28 @@ class DepMamba(BaseNet):
         xv = x[:, :, :136]
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
-        # ===== ES-Mamba: 使用 Conv 后的音频特征做 Evidence Selection =====
-        # 当前 xa: (B, L, mm_input_size) -> 转成 (B, D, L) 喂给 Selector
-        xa_for_sel = xa.permute(0, 2, 1)           # (B, D, L)
-        gate_a, logits_a = self.audio_selector(xa_for_sel)  # gate_a: (B, 1, L)
+        # ===== 1) Audio master gate: EvidenceSelector =====
+        xa_for_sel = xa.permute(0, 2, 1)                 # (B, D, L)
+        gate_a, logits_a = self.audio_selector(xa_for_sel)  # (B, 1, L)
+        self.last_audio_gate = gate_a                    # 训练时给 loss 用
 
-        # 先不把 gate 用到后续计算，只保存下来，后面加稀疏 loss / Mamba gating 时会用到
-        self.last_audio_gate = gate_a
-        # ===============================================================
+        # ===== 2) Video slave gate: VideoSelector =====
+        xv_for_sel = xv.permute(0, 2, 1)                 # (B, D, L)
+        gate_v_raw, logits_v = self.video_selector(xv_for_sel)  # (B, 1, L)
 
-        # ===== ESMamba-input：用 gate 先做一次输入级 Mask =====
-        # xa: (B, L, D), gate_a: (B, 1, L) -> (B, L, 1)
-        gate_a_t = gate_a.permute(0, 2, 1)         # (B, L, 1)
-        xa = xa * gate_a_t                         # 广播到 D 维
+        # 主仆式策略：语音限制视觉的激活范围
+        # G_V = G_A ⊙ σ(Conv1D(X_V))
+        gate_a_master = gate_a.detach()
+        gate_v = gate_a_master * gate_v_raw           # video 只在 audio 允许的地方激活
+        self.last_video_gate = gate_v
+
+        # ===== 3) 输入级 Mask：音频 & 视频各自用自己的 gate =====
+        gate_a_t = gate_a.permute(0, 2, 1)   # (B, L, 1)
+        gate_v_t = gate_v.permute(0, 2, 1)   # (B, L, 1)
+
+        alpha = 0.5  # 最小保留 50% 能量
+        xa = xa * (alpha + (1 - alpha) * gate_a_t)   # gate=0 -> 0.5, gate=1 -> 1.0
+        xv = xv * (alpha + (1 - alpha) * gate_v_t)
         # ======================================================
         
         xa, xv = self.cossm_encoder(
