@@ -7,7 +7,7 @@ dataset: dvlog #dvlog or lmvd
 train: true
 epochs: 120
 batch_size: 16
-learning_rate: 8e-5
+learning_rate: 4e-5
 lr_scheduler: cos
 if_wandb: false
 save_dir: "/home/ac/data/bai/DepMamba-main/savefile/"
