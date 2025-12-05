@@ -397,9 +397,9 @@ class EnSSM(nn.Module):
 
 class DepMamba(BaseNet):
 
-    def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None):
+    def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None,use_gate: bool = True):
         super().__init__()
-
+        self.use_gate = use_gate 
         self.cossm_encoder = CoSSM(num_layers,
                                          mm_input_size,
                                     mm_output_sizes,
@@ -429,6 +429,7 @@ class DepMamba(BaseNet):
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
         # ===== ES-Mamba: 新增，音频 Evidence Selector（当前只计算，不参与决策） =====
+         # ===== ES-Mamba: Evidence Selector（只在 use_gate=True 时使用）=====
         # xa 在 Conv 之后的形状是 (B, L, mm_input_size)，Selector 期望 (B, D, L)
         selector_tau = 1.0   # 先写死，后面可以放到 config 里
         self.audio_selector = EvidenceSelector(
@@ -456,34 +457,41 @@ class DepMamba(BaseNet):
         xv = x[:, :, :136]
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
-        # ===== 1) Audio master gate: EvidenceSelector =====
-        xa_for_sel = xa.permute(0, 2, 1)                 # (B, D, L)
-        gate_a, logits_a = self.audio_selector(xa_for_sel)  # (B, 1, L)
-        self.last_audio_gate = gate_a                    # 训练时给 loss 用
+        # ---------- 分两种模式：Student(带 gate) / Teacher(无 gate) ----------
+        if self.use_gate:
+            # ===== 1) Audio master gate: EvidenceSelector =====
+            xa_for_sel = xa.permute(0, 2, 1)                     # (B, D, L)
+            gate_a, logits_a = self.audio_selector(xa_for_sel)   # (B, 1, L)
+            self.last_audio_gate = gate_a
 
-        # ===== 2) Video slave gate: VideoSelector =====
-        xv_for_sel = xv.permute(0, 2, 1)                 # (B, D, L)
-        gate_v_raw, logits_v = self.video_selector(xv_for_sel)  # (B, 1, L)
+            # ===== 2) Video slave gate: VideoSelector =====
+            xv_for_sel = xv.permute(0, 2, 1)                     # (B, D, L)
+            gate_v_raw, logits_v = self.video_selector(xv_for_sel)  # (B, 1, L)
 
-        # 主仆式策略：语音限制视觉的激活范围
-        # G_V = G_A ⊙ σ(Conv1D(X_V))
-        gate_a_master = gate_a.detach()
-        gate_v = gate_a_master * gate_v_raw           # video 只在 audio 允许的地方激活
-        self.last_video_gate = gate_v
+            # 主仆式策略：视频只能在音频“允许”的地方激活
+            gate_a_master = gate_a.detach()
+            gate_v = gate_a_master * gate_v_raw
+            self.last_video_gate = gate_v
 
-        # ===== 3) 输入级 Mask：音频 & 视频各自用自己的 gate =====
-        gate_a_t = gate_a.permute(0, 2, 1)   # (B, L, 1)
-        gate_v_t = gate_v.permute(0, 2, 1)   # (B, L, 1)
+            # ===== 3) 输入级 Mask：音频 & 视频各自用自己的 gate =====
+            gate_a_t = gate_a.permute(0, 2, 1)   # (B, L, 1)
+            gate_v_t = gate_v.permute(0, 2, 1)   # (B, L, 1)
 
-        alpha = 0.5  # 最小保留 50% 能量
-        xa = xa * (alpha + (1 - alpha) * gate_a_t)   # gate=0 -> 0.5, gate=1 -> 1.0
-        xv = xv * (alpha + (1 - alpha) * gate_v_t)
-        # ======================================================
+            alpha = 0.5  # 最小保留 50% 能量
+            xa = xa * (alpha + (1 - alpha) * gate_a_t)   # gate=0 -> 0.5, gate=1 -> 1.0
+            xv = xv * (alpha + (1 - alpha) * gate_v_t)
+
+            gate_for_mamba = self.last_audio_gate  # audio gate 控制 Δ
+        else:
+            # Teacher 模式：完全不用 gate，相当于“全量 DepMamba”
+            self.last_audio_gate = None
+            self.last_video_gate = None
+            gate_for_mamba = None
         
         xa, xv = self.cossm_encoder(
             xa,
             xv,
-            gate=self.last_audio_gate,             # ★ 传给 CoSSM / ES-BiMamba
+            gate=gate_for_mamba,             # ★ 传给 CoSSM / ES-BiMamba
             a_inference_params=a_inference_params,
             v_inference_params=v_inference_params,
         )
@@ -491,7 +499,7 @@ class DepMamba(BaseNet):
         x = torch.cat([xa,xv],dim=-1)
         x = self.enssm_encoder(
             x,
-            gate=self.last_audio_gate,   
+            gate=gate_for_mamba,   
             inference_params=None,
         )
         
@@ -505,3 +513,29 @@ class DepMamba(BaseNet):
 
     def classifier(self, x):
         return self.output(x)
+    
+    def forward(
+        self,
+        x,
+        padding_mask=None,
+        a_inference_params=None,
+        v_inference_params=None,
+        return_feat: bool = False,
+    ):
+        """
+        x: (B, T, D_in)
+        return_feat=False 时，行为和原来一样，返回 logits
+        return_feat=True 时，返回 (logits, feat)
+        """
+        feat = self.feature_extractor(
+            x,
+            padding_mask=padding_mask,
+            a_inference_params=a_inference_params,
+            v_inference_params=v_inference_params,
+        )                               # feat: (B, hidden_dim)
+        logits = self.classifier(feat)  # (B, 1)
+
+        if return_feat:
+            return logits, feat
+        else:
+            return logits

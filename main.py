@@ -15,7 +15,19 @@ from datasets import get_dvlog_dataloader, get_lmvd_dataloader
 
 
 CONFIG_PATH = "./config/config.yaml"
+TEACHER_CKPT = "/home/ac/data/bai/DepMamba-main/Teacher_checkpoints/best_model.pt"
 
+def get_lambda_kd(epoch: int) -> float:
+    """
+    KD 损失的权重：前 5 个 epoch 不用 KD，
+    5~30 线性升到 0.2，之后固定 0.2。
+    """
+    if epoch < 5:
+        return 0.0
+    elif epoch < 30:
+        return 0.2 * (epoch - 5) / 25.0
+    else:
+        return 0.2
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -57,16 +69,24 @@ def parse_args():
 
 
 def train_epoch(
-    net, train_loader, loss_fn, optimizer, device, 
-    current_epoch, total_epochs, tqdm_able
+    net,
+    teacher_net,                 # <<< 新增
+    train_loader,
+    loss_fn,
+    optimizer,
+    device,
+    current_epoch,
+    total_epochs,
+    tqdm_able,
 ):
     """One training epoch.
     """
     net.train()
     sample_count = 0
-    running_loss = 0.
+    running_loss = 0.0
     correct_count = 0
- # --- 为画曲线准备的一些 epoch 级统计 ---
+
+    # --- 为画曲线准备的一些 epoch 级统计 ---
     gate_a_sum = 0.0
     gate_a_keep_sum = 0.0
     gate_v_sum = 0.0
@@ -75,16 +95,14 @@ def train_epoch(
 
     loss_s_sum = 0.0
     loss_c_sum = 0.0
-
-
-
+    kd_loss_sum = 0.0          # <<< 新增：统计 KD loss
 
     # ====== ES-Mamba: 控制 EvidenceSelector 的 tau / hard ======
     core_net = net.module if isinstance(net, torch.nn.DataParallel) else net
 
     # 1) soft->hard curriculum：前 30 个 epoch 一律 hard=False
-    hard_start_epoch = 30
-    use_hard = (current_epoch >= hard_start_epoch)
+    hard_start_epoch = 99999
+    use_hard = current_epoch >= hard_start_epoch
 
     # 2) tau 退火：从 3.0 慢慢降到 0.5，别再往下了
     tau0 = 3.0
@@ -95,22 +113,40 @@ def train_epoch(
     if hasattr(core_net, "audio_selector"):
         core_net.audio_selector.hard = use_hard
         core_net.audio_selector.tau = tau_now
-    # 如果以后还想给 video selector 也用 gumbel，可以类似处理
     # =======================================================
 
+    # KD 系数（这个 epoch 整体共用一份）
+    lambda_kd = get_lambda_kd(current_epoch) if teacher_net is not None else 0.0
+
     with tqdm(
-        train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}",
-        leave=False, unit="batch", disable=tqdm_able
+        train_loader,
+        desc=f"Training epoch {current_epoch}/{total_epochs}",
+        leave=False,
+        unit="batch",
+        disable=tqdm_able,
     ) as pbar:
         for x, y, mask in pbar:
-            # print(x.shape,y.shape)
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
-            y_pred = net(x, mask)
-            
+
+            # -------- Teacher / Student 前向 --------
+            if (teacher_net is not None) and (lambda_kd > 0.0):
+                # Teacher 只做前向，不求梯度
+                with torch.no_grad():
+                    t_logits, t_feat = teacher_net(x, mask, return_feat=True)
+
+                s_logits, s_feat = net(x, mask, return_feat=True)
+            else:
+                # 不做 KD，只算学生
+                s_logits = net(x, mask)
+                s_feat = None
+                t_logits = None
+                t_feat = None
+
             # 兼容 DataParallel 和 单卡两种情况
             core_net = net.module if isinstance(net, torch.nn.DataParallel) else net
-            gate_a = getattr(core_net, "last_audio_gate", None)   # (B, 1, L) or None
-            gate_v = getattr(core_net, "last_video_gate", None)   # (B, 1, L) or None
+            gate_a = getattr(core_net, "last_audio_gate", None)  # (B, 1, L) or None
+            gate_v = getattr(core_net, "last_video_gate", None)  # (B, 1, L) or None
+
             # ====== audio gate：打印 + 正则 ======
             if gate_a is not None:
                 g = gate_a                           # 不 detach，用来算正则
@@ -150,22 +186,37 @@ def train_epoch(
                 )
 
             lambda_sparse = get_lambda_sparse(current_epoch)
-            lambda_cont   = get_lambda_cont(current_epoch)
-            loss_cls = loss_fn(y_pred, y.to(torch.float32))
+            lambda_cont = get_lambda_cont(current_epoch)
+            loss_cls = loss_fn(s_logits, y.to(torch.float32))
             loss_s_term = lambda_sparse * loss_sparsity
             loss_c_term = lambda_cont * loss_continuity
+
+            # ----- KD loss（feature + logit，简单 MSE）-----
+            if (teacher_net is not None) and (lambda_kd > 0.0) and (s_feat is not None):
+                # teacher / student 的 sigmoid 概率
+                p_t = torch.sigmoid(t_logits.detach())
+                p_s = torch.sigmoid(s_logits)
+
+                # 单标签二分类，用对称 KL 或者简单的 MSE 都行
+                # 版本 A：MSE
+                loss_kd = torch.mean((p_s - p_t) ** 2)
+            else:
+                loss_kd = torch.tensor(0.0, device=device)
 
             if current_epoch % 2 == 0 and random.random() < 0.05:
                 print(
                     f"[epoch {current_epoch}] "
                     f"loss_cls={loss_cls.item():.3f}, "
                     f"λ_s*Ls={loss_s_term.item():.3f}, "
-                    f"λ_c*Lc={loss_c_term.item():.3f}"
+                    f"λ_c*Lc={loss_c_term.item():.3f}, "
+                    f"λ_kd*L_kd={(lambda_kd * loss_kd.item()):.3f}"
                 )
 
-            loss = loss_cls + loss_s_term + loss_c_term
+            # 总 loss
+            loss = loss_cls + loss_s_term + loss_c_term + lambda_kd * loss_kd
             loss.backward()
-# ------- 统计 gate / loss_s / loss_c 的 epoch 均值 -------
+
+            # ------- 统计 gate / loss_s / loss_c / loss_kd 的 epoch 均值 -------
             bsz = x.size(0)
             if gate_a is not None:
                 g_det = gate_a.detach()
@@ -180,6 +231,8 @@ def train_epoch(
                 gate_v_sum += gv_det.mean().item() * bsz
                 gate_v_keep_sum += (gv_det > 0.5).float().mean().item() * bsz
 
+            kd_loss_sum += (lambda_kd * loss_kd.item()) * bsz
+
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
@@ -187,28 +240,32 @@ def train_epoch(
             sample_count += x.shape[0]
             running_loss += loss.item() * x.shape[0]
             # binary classification with only one output neuron
-            pred = (y_pred > 0.).int()
+            pred = (s_logits > 0.0).int()
             correct_count += (pred == y).sum().item()
 
-            pbar.set_postfix({
-                "loss": running_loss / sample_count,
-                "acc": correct_count / sample_count,
-            })
+            pbar.set_postfix(
+                {
+                    "loss": running_loss / sample_count,
+                    "acc": correct_count / sample_count,
+                }
+            )
 
     epoch_loss = running_loss / sample_count
-    epoch_acc  = correct_count / sample_count
+    epoch_acc = correct_count / sample_count
 
     if gate_count > 0:
         gate_a_mean = gate_a_sum / gate_count
         gate_a_keep = gate_a_keep_sum / gate_count
         gate_v_mean = gate_v_sum / gate_count
         gate_v_keep = gate_v_keep_sum / gate_count
-        loss_s_avg  = loss_s_sum / gate_count
-        loss_c_avg  = loss_c_sum / gate_count
+        loss_s_avg = loss_s_sum / gate_count
+        loss_c_avg = loss_c_sum / gate_count
     else:
         gate_a_mean = gate_a_keep = 0.0
         gate_v_mean = gate_v_keep = 0.0
         loss_s_avg = loss_c_avg = 0.0
+
+    loss_kd_avg = kd_loss_sum / sample_count if sample_count > 0 else 0.0
 
     return {
         "loss": epoch_loss,
@@ -219,6 +276,7 @@ def train_epoch(
         "gate_v_keep": gate_v_keep,
         "loss_s": loss_s_avg,
         "loss_c": loss_c_avg,
+        "loss_kd": loss_kd_avg,     # <<< 新增
     }
 
 
@@ -289,15 +347,14 @@ def val(
 def get_lambda_sparse(epoch: int) -> float:
     """
     稀疏正则：前 30 epoch 不加，
-    30~90 线性升到 0.05，之后保持 0.05。
+    30~90 线性升到 0.1，之后保持 0.1。
     """
     if epoch < 30:
         return 0.0
     elif epoch < 90:
-        # 30 -> 90 之间从 0 线性升到 0.05
-        return 0.05 * (epoch - 30) / 60.0
+        return 0.1 * (epoch - 30) / 60.0   # 0 -> 0.1
     else:
-        return 0.05
+        return 0.1
 
 
 def get_lambda_cont(epoch: int) -> float:
@@ -328,6 +385,7 @@ def main():
             "val_precision": [],
             "val_recall": [],
             "val_f1": [],
+            "train_loss_kd": [],
         }
         if args.if_wandb:
             wandb_run_name = f"{args.model}-{args.train_gender}-{args.test_gender}"
@@ -342,16 +400,57 @@ def main():
         os.makedirs(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints", exist_ok=True)
 
         # construct the model
+        # ---------- construct the student model (ES-DepMamba, use_gate=True) ----------
         if args.model == "DepMamba":
-            if args.dataset=='lmvd':
-                net = DepMamba(**args.mmmamba_lmvd)# mmmamba_lmvd mmmamba
-            elif args.dataset=='dvlog':
-                net = DepMamba(**args.mmmamba)# mmmamba_lmvd mmmamba
-        else:#if args.model == "MAMBA":
-            raise NotImplementedError(f"The {args.model} method has not been implemented by this repo")
+            if args.dataset == "lmvd":
+                student_cfg = dict(args.mmmamba_lmvd)
+            elif args.dataset == "dvlog":
+                student_cfg = dict(args.mmmamba)
+            else:
+                raise ValueError(f"Unknown dataset {args.dataset}")
+
+            student_cfg["use_gate"] = True   # 学生：打开 gate
+            net = DepMamba(**student_cfg)
+        else:
+            raise NotImplementedError(
+                f"The {args.model} method has not been implemented by this repo"
+            )
+
         net = net.to(args.device[0])
         if len(args.device) > 1:
             net = torch.nn.DataParallel(net, device_ids=args.device)
+
+        # ---------- construct the teacher model (frozen, no gate) ----------
+        teacher_net = None
+        if os.path.exists(TEACHER_CKPT):
+            print(f"Loading teacher checkpoint from: {TEACHER_CKPT}")
+            if args.dataset == "lmvd":
+                teacher_cfg = dict(args.mmmamba_lmvd)
+            elif args.dataset == "dvlog":
+                teacher_cfg = dict(args.mmmamba)
+            teacher_cfg["use_gate"] = False   # Teacher：关闭 gate，走全量 DepMamba
+
+            teacher_net = DepMamba(**teacher_cfg)
+            teacher_net = teacher_net.to(args.device[0])
+            if len(args.device) > 1:
+                teacher_net = torch.nn.DataParallel(
+                    teacher_net, device_ids=args.device
+                )
+
+            state = torch.load(TEACHER_CKPT, map_location=args.device[0])
+            # 旧权重可能没有 gate 相关参数，用 strict=False 更稳一点
+            missing, unexpected = teacher_net.load_state_dict(state, strict=False)
+            print(
+                f"Teacher ckpt loaded. missing={len(missing)}, unexpected={len(unexpected)}"
+            )
+
+            for p in teacher_net.parameters():
+                p.requires_grad = False
+            teacher_net.eval()
+        else:
+            print(
+                f"[WARN] Teacher checkpoint not found at {TEACHER_CKPT}，本次训练不做 KD。"
+            )
 
         # prepare the data
         if args.dataset=='dvlog':
@@ -384,7 +483,7 @@ def main():
         if args.train:
             for epoch in range(args.epochs):
                 train_results = train_epoch(
-                    net, train_loader, loss_fn, optimizer, 
+                    net,teacher_net, train_loader, loss_fn, optimizer, 
                     args.device[0], epoch, args.epochs, args.tqdm_able
                 )
                 val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
@@ -393,6 +492,7 @@ def main():
                 history["train_acc"].append(float(train_results["acc"]))
                 history["train_loss_s"].append(float(train_results["loss_s"]))
                 history["train_loss_c"].append(float(train_results["loss_c"]))
+                history["train_loss_kd"].append(float(train_results["loss_kd"]))  # <<< 新增
                 history["gate_a_mean"].append(float(train_results["gate_a_mean"]))
                 history["gate_a_keep"].append(float(train_results["gate_a_keep"]))
                 history["gate_v_mean"].append(float(train_results["gate_v_mean"]))
