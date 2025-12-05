@@ -10,8 +10,10 @@ from tqdm import tqdm
 
 import random
 import numpy as np
-from models import DepMamba
+
 from datasets import get_dvlog_dataloader, get_lmvd_dataloader
+import torch.nn.functional as F
+from models import DepMamba, DepMambaTeacher
 
 
 CONFIG_PATH = "./config/config.yaml"
@@ -128,19 +130,17 @@ def train_epoch(
         for x, y, mask in pbar:
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
 
-            # -------- Teacher / Student 前向 --------
+            # -------- Teacher / Student 前向（只用 logits 做 KD）--------
             if (teacher_net is not None) and (lambda_kd > 0.0):
                 # Teacher 只做前向，不求梯度
                 with torch.no_grad():
-                    t_logits, t_feat = teacher_net(x, mask, return_feat=True)
+                    t_logits = teacher_net(x, mask)   # (B, 1)
 
-                s_logits, s_feat = net(x, mask, return_feat=True)
+                s_logits = net(x, mask)              # (B, 1)
             else:
                 # 不做 KD，只算学生
                 s_logits = net(x, mask)
-                s_feat = None
                 t_logits = None
-                t_feat = None
 
             # 兼容 DataParallel 和 单卡两种情况
             core_net = net.module if isinstance(net, torch.nn.DataParallel) else net
@@ -192,13 +192,12 @@ def train_epoch(
             loss_c_term = lambda_cont * loss_continuity
 
             # ----- KD loss（feature + logit，简单 MSE）-----
-            if (teacher_net is not None) and (lambda_kd > 0.0) and (s_feat is not None):
+            if (teacher_net is not None) and (lambda_kd > 0.0) and (t_logits is not None):
                 # teacher / student 的 sigmoid 概率
                 p_t = torch.sigmoid(t_logits.detach())
                 p_s = torch.sigmoid(s_logits)
 
-                # 单标签二分类，用对称 KL 或者简单的 MSE 都行
-                # 版本 A：MSE
+                # 二分类：用 MSE 很简单稳定
                 loss_kd = torch.mean((p_s - p_t) ** 2)
             else:
                 loss_kd = torch.tensor(0.0, device=device)
@@ -420,37 +419,33 @@ def main():
         if len(args.device) > 1:
             net = torch.nn.DataParallel(net, device_ids=args.device)
 
-        # ---------- construct the teacher model (frozen, no gate) ----------
+        # ---------- construct the teacher model (frozen, old DepMamba) ----------
         teacher_net = None
         if os.path.exists(TEACHER_CKPT):
             print(f"Loading teacher checkpoint from: {TEACHER_CKPT}")
+
+            # 老 DepMamba 的 config，和当时你训练 Teacher 的保持一致
             if args.dataset == "lmvd":
                 teacher_cfg = dict(args.mmmamba_lmvd)
             elif args.dataset == "dvlog":
                 teacher_cfg = dict(args.mmmamba)
-            teacher_cfg["use_gate"] = False   # Teacher：关闭 gate，走全量 DepMamba
+            else:
+                raise ValueError(f"Unknown dataset {args.dataset}")
 
-            teacher_net = DepMamba(**teacher_cfg)
+            # 注意：老的 DepMambaTeacher 没有 use_gate 这个参数，所以不要加 use_gate
+            teacher_net = DepMambaTeacher(**teacher_cfg)
             teacher_net = teacher_net.to(args.device[0])
-            if len(args.device) > 1:
-                teacher_net = torch.nn.DataParallel(
-                    teacher_net, device_ids=args.device
-                )
 
+            # Teacher 通常不需要 DataParallel，用单卡就够了；如果你想，也可以套一层 DP
             state = torch.load(TEACHER_CKPT, map_location=args.device[0])
-            # 旧权重可能没有 gate 相关参数，用 strict=False 更稳一点
-            missing, unexpected = teacher_net.load_state_dict(state, strict=False)
-            print(
-                f"Teacher ckpt loaded. missing={len(missing)}, unexpected={len(unexpected)}"
-            )
+            teacher_net.load_state_dict(state, strict=True)
+            print("Teacher ckpt loaded successfully.")
 
             for p in teacher_net.parameters():
                 p.requires_grad = False
             teacher_net.eval()
         else:
-            print(
-                f"[WARN] Teacher checkpoint not found at {TEACHER_CKPT}，本次训练不做 KD。"
-            )
+            print(f"[WARN] Teacher checkpoint not found at {TEACHER_CKPT}，本次训练不做 KD。")
 
         # prepare the data
         if args.dataset=='dvlog':
