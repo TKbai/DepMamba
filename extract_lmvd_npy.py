@@ -36,9 +36,9 @@ def extract_features_single(input_file, output_file):
     data = data.values
     data = data[:, 1:]
 
-    data = preprocessing.scale(data, axis=-1)
+    data = preprocessing.scale(data, axis=0)
     np.save(output_file, data)
 
 
 # Example usage
-extract_visual_features('./lmvd/Video_feature', './lmvd/visual')
+extract_visual_features('/home/ac/data/bai/DepMamba-main/datasets/lmvd/Video_feature', '/home/ac/data/bai/DepMamba-main/datasets/lmvd/visual')

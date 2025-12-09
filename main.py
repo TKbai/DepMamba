@@ -21,15 +21,21 @@ TEACHER_CKPT = "/home/ac/data/bai/DepMamba-main/Teacher_checkpoints/best_model.p
 
 def get_lambda_kd(epoch: int) -> float:
     """
-    KD 损失的权重：前 5 个 epoch 不用 KD，
-    5~30 线性升到 0.2，之后固定 0.2。
+    0~5  : 不蒸馏，先让 Student 自己站稳
+    5~30 : 线性升到 0.2
+    30~60: 保持 0.2（过渡期）
+    60+  : 再升到 0.6，让 Student 更像 Teacher（更“谨慎”）
     """
     if epoch < 5:
         return 0.0
     elif epoch < 30:
         return 0.2 * (epoch - 5) / 25.0
-    else:
+    elif epoch < 60:
         return 0.2
+    elif epoch < 90:
+        return 0.2 + (0.6 - 0.2) * (epoch - 60) / 30.0  # 60~90: 0.2 -> 0.6
+    else:
+        return 0.6
 
 def setup_seed(seed):
     torch.manual_seed(seed)
