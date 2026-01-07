@@ -13,29 +13,43 @@ import numpy as np
 
 from datasets import get_dvlog_dataloader, get_lmvd_dataloader
 import torch.nn.functional as F
-from models import DepMamba, DepMambaTeacher
+from models import DepMamba
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
 
 
 CONFIG_PATH = "./config/config.yaml"
-TEACHER_CKPT = "/home/ac/data/bai/DepMamba-main/Teacher_checkpoints/best_model.pt"
+TEACHER_CKPT = "/home/ac/data/bai/DepMamba-main/Teacher_checkpoints/es_mamba_v1_teacher.pt"
+USE_SELF_KD = True  # ⭐ True=用自蒸馏 KD；False=完全关掉 KD，当纯 supervised baseline
 
-def get_lambda_kd(epoch: int) -> float:
+def get_lambda_kd(epoch: int, max_epoch: int) -> float:
     """
-    0~5  : 不蒸馏，先让 Student 自己站稳
-    5~30 : 线性升到 0.2
-    30~60: 保持 0.2（过渡期）
-    60+  : 再升到 0.6，让 Student 更像 Teacher（更“谨慎”）
+    KD 退火策略：
+      - 前 25% epoch：KD 权重 = max_kd
+      - 中间 50% epoch：线性从 max_kd 降到 0
+      - 最后 25% epoch：KD = 0
+
+    如果 USE_SELF_KD=False，则全程返回 0（完全不蒸馏）。
     """
-    if epoch < 5:
+    if not USE_SELF_KD:
         return 0.0
-    elif epoch < 30:
-        return 0.2 * (epoch - 5) / 25.0
-    elif epoch < 60:
-        return 0.2
-    elif epoch < 90:
-        return 0.2 + (0.6 - 0.2) * (epoch - 60) / 30.0  # 60~90: 0.2 -> 0.6
-    else:
-        return 0.6
+
+    warmup_ratio = 0.25
+    decay_ratio  = 0.50
+
+    warmup_end = int(max_epoch * warmup_ratio)
+    decay_end  = int(max_epoch * (warmup_ratio + decay_ratio))
+
+    max_kd = 0.5   # 自蒸馏阶段 KD 的最高权重，你方案 A 用的是 0.5 就继续沿用
+
+    if epoch < warmup_end:
+        return max_kd
+
+    if epoch < decay_end:
+        denom = max(1, decay_end - warmup_end)
+        return max_kd * (1.0 - (epoch - warmup_end) / denom)
+
+    return 0.0
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -123,8 +137,8 @@ def train_epoch(
         core_net.audio_selector.tau = tau_now
     # =======================================================
 
-    # KD 系数（这个 epoch 整体共用一份）
-    lambda_kd = get_lambda_kd(current_epoch) if teacher_net is not None else 0.0
+    # KD 系数（这个 epoch 整体共用一份，带退火）
+    lambda_kd = get_lambda_kd(current_epoch, total_epochs) if teacher_net is not None else 0.0
 
     with tqdm(
         train_loader,
@@ -197,14 +211,30 @@ def train_epoch(
             loss_s_term = lambda_sparse * loss_sparsity
             loss_c_term = lambda_cont * loss_continuity
 
-            # ----- KD loss（feature + logit，简单 MSE）-----
+            # ----- KD loss：只在 Teacher 预测正确的样本上蒸馏 -----
             if (teacher_net is not None) and (lambda_kd > 0.0) and (t_logits is not None):
                 # teacher / student 的 sigmoid 概率
-                p_t = torch.sigmoid(t_logits.detach())
-                p_s = torch.sigmoid(s_logits)
+                p_t = torch.sigmoid(t_logits.detach())   # (B, 1)
+                p_s = torch.sigmoid(s_logits)            # (B, 1)
 
-                # 二分类：用 MSE 很简单稳定
-                loss_kd = torch.mean((p_s - p_t) ** 2)
+                # 每个样本的 MSE
+                kd_per_sample = F.mse_loss(p_s, p_t, reduction='none')   # (B, 1)
+                kd_per_sample = kd_per_sample.view(-1)                   # (B,)
+
+                # Teacher 的 hard 预测
+                pred_t = (t_logits > 0.0).int()          # (B, 1)
+
+                # GT 标签（确保是 int）
+                targets = y.int()                         # (B, 1)
+
+                # 哪些样本 Teacher 预测正确
+                is_correct = (pred_t == targets).view(-1).float()   # (B,)
+
+                if is_correct.sum() > 0:
+                    # 只对 Teacher 正确的样本求平均
+                    loss_kd = (kd_per_sample * is_correct).sum() / is_correct.sum()
+                else:
+                    loss_kd = torch.tensor(0.0, device=device)
             else:
                 loss_kd = torch.tensor(0.0, device=device)
 
@@ -348,6 +378,85 @@ def val(
         "precision": precision, "recall": recall, "f1": f1_score,
     }
 
+def eval_with_scores(net, data_loader, loss_fn, device, tqdm_able):
+    """
+    和 val 类似，但额外返回：
+      - y_true: 所有样本的 0/1 标签 (numpy array)
+      - y_score: 所有样本的正类概率（sigmoid(logit））(numpy array)
+    用来画 ROC / 计算 AUC.
+    """
+    net.eval()
+    sample_count = 0
+    running_loss = 0.
+    TP, FP, TN, FN = 0, 0, 0, 0
+
+    all_labels = []
+    all_scores = []
+
+    with torch.no_grad():
+        with tqdm(
+            data_loader, desc="Evaluating (with scores)", leave=False,
+            unit="batch", disable=tqdm_able
+        ) as pbar:
+            for x, y, mask in pbar:
+                x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
+                logits = net(x, mask)                         # (B,1)
+                loss = loss_fn(logits, y.to(torch.float32))
+
+                # ======== 收集用于 ROC 的分数和标签 ========
+                probs = torch.sigmoid(logits).view(-1).cpu().numpy()  # 正类概率
+                labels = y.view(-1).cpu().numpy()
+                all_scores.append(probs)
+                all_labels.append(labels)
+                # ===========================================
+
+                sample_count += x.shape[0]
+                running_loss += loss.item() * x.shape[0]
+
+                pred = (logits > 0.).int()
+                TP += torch.sum((pred == 1) & (y == 1)).item()
+                FP += torch.sum((pred == 1) & (y == 0)).item()
+                TN += torch.sum((pred == 0) & (y == 0)).item()
+                FN += torch.sum((pred == 0) & (y == 1)).item()
+
+                l = running_loss / sample_count
+                precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+                recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+                f1_score = (
+                    2 * (precision * recall) / (precision + recall) 
+                    if (precision + recall) > 0 else 0.0
+                )
+                accuracy = (
+                    (TP + TN) / sample_count
+                    if sample_count > 0 else 0.0
+                )
+
+                pbar.set_postfix({
+                    "loss": l, "acc": accuracy,
+                    "precision": precision, "recall": recall, "f1": f1_score,
+                })
+
+    l = running_loss / sample_count
+    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+    recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+    f1_score = (
+        2 * (precision * recall) / (precision + recall) 
+        if (precision + recall) > 0 else 0.0
+    )
+    accuracy = (
+        (TP + TN) / sample_count
+        if sample_count > 0 else 0.0
+    )
+
+    metrics = {
+        "loss": l, "acc": accuracy,
+        "precision": precision, "recall": recall, "f1": f1_score,
+    }
+
+    all_labels = np.concatenate(all_labels, axis=0)
+    all_scores = np.concatenate(all_scores, axis=0)
+    return metrics, all_labels, all_scores
+
 # ====== ES-Mamba: 稀疏 / 连续性正则的 warm-up 系数 ======
 def get_lambda_sparse(epoch: int) -> float:
     """
@@ -425,12 +534,12 @@ def main():
         if len(args.device) > 1:
             net = torch.nn.DataParallel(net, device_ids=args.device)
 
-        # ---------- construct the teacher model (frozen, old DepMamba) ----------
+        # ---------- construct the teacher model (frozen, ES-Mamba V1) ----------
         teacher_net = None
-        if os.path.exists(TEACHER_CKPT):
-            print(f"Loading teacher checkpoint from: {TEACHER_CKPT}")
+        if USE_SELF_KD and os.path.exists(TEACHER_CKPT):
+            print(f"Loading ES-Mamba V1 teacher checkpoint from: {TEACHER_CKPT}")
 
-            # 老 DepMamba 的 config，和当时你训练 Teacher 的保持一致
+            # 和 student 一样的配置（包括 use_gate=True），确保结构完全一致
             if args.dataset == "lmvd":
                 teacher_cfg = dict(args.mmmamba_lmvd)
             elif args.dataset == "dvlog":
@@ -438,14 +547,14 @@ def main():
             else:
                 raise ValueError(f"Unknown dataset {args.dataset}")
 
-            # 注意：老的 DepMambaTeacher 没有 use_gate 这个参数，所以不要加 use_gate
-            teacher_net = DepMambaTeacher(**teacher_cfg)
+            teacher_cfg["use_gate"] = True      # V1 当时就是打开 gate 训练的
+
+            teacher_net = DepMamba(**teacher_cfg)
             teacher_net = teacher_net.to(args.device[0])
 
-            # Teacher 通常不需要 DataParallel，用单卡就够了；如果你想，也可以套一层 DP
             state = torch.load(TEACHER_CKPT, map_location=args.device[0])
             teacher_net.load_state_dict(state, strict=True)
-            print("Teacher ckpt loaded successfully.")
+            print("ES-Mamba V1 teacher ckpt loaded successfully.")
 
             for p in teacher_net.parameters():
                 p.requires_grad = False
@@ -531,9 +640,39 @@ def main():
                 )
             )
             net.eval()
-            test_results = val(net, test_loader, loss_fn, args.device[0], args.tqdm_able)
+
+            # ===== 用带 scores 的评估函数 =====
+            test_results, y_true, y_score = eval_with_scores(
+                net, test_loader, loss_fn, args.device[0], args.tqdm_able
+            )
             print("Test results:")
             print(test_results)
+
+            # ===== 计算 ROC 曲线和 AUC =====
+            fpr, tpr, thresholds = roc_curve(y_true, y_score)
+            roc_auc = auc(fpr, tpr)
+            print(f"AUC (test) = {roc_auc:.4f}")
+
+            # 保存 ROC 数据，方便之后画多个模型的对比图
+            run_dir = f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}"
+            os.makedirs(run_dir, exist_ok=True)
+            np.savez(
+                os.path.join(run_dir, "roc_test.npz"),
+                fpr=fpr, tpr=tpr, thresholds=thresholds, auc=roc_auc
+            )
+
+            # 画单条 ROC 曲线（当前这个模型）
+            plt.figure()
+            plt.plot(fpr, tpr, label=f"{args.model} (AUC={roc_auc:.3f})")
+            plt.plot([0, 1], [0, 1], linestyle="--")
+            plt.xlabel("False Positive Rate")
+            plt.ylabel("True Positive Rate")
+            plt.title(f"ROC on {args.dataset} (test)")
+            plt.legend(loc="lower right")
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(run_dir, "roc_test.png"), dpi=300)
+            plt.close()
 
             # -------- 保存 test 结果到 txt --------
             avg_score = (
@@ -578,5 +717,5 @@ def main():
 
 
 if __name__ == '__main__':
-    setup_seed(2000)
+    setup_seed(2222)
     main()
