@@ -15,19 +15,7 @@ from datasets import get_dvlog_dataloader, get_lmvd_dataloader
 
 
 CONFIG_PATH = "./config/config.yaml"
-TEACHER_CKPT = "/home/ac/data/bai/DepMamba-main/Teacher_checkpoints/best_model.pt"
 
-def get_lambda_kd(epoch: int) -> float:
-    """
-    KD 损失的权重：前 5 个 epoch 不用 KD，
-    5~30 线性升到 0.2，之后固定 0.2。
-    """
-    if epoch < 5:
-        return 0.0
-    elif epoch < 30:
-        return 0.2 * (epoch - 5) / 25.0
-    else:
-        return 0.2
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -35,22 +23,19 @@ def setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False     # 禁止自动寻找最优算子
+    torch.backends.cudnn.benchmark = False  # 禁止自动寻找最优算子
+
 
 def parse_args():
     with open(CONFIG_PATH, "r") as f:
         config = yaml.safe_load(f)
 
-    parser = argparse.ArgumentParser(
-        description="Train and test a model."
-    )
+    parser = argparse.ArgumentParser(description="Train and test a model.")
     # arguments whose default values are in config.yaml
     parser.add_argument("--data_dir", type=str)
     parser.add_argument("--train_gender", type=str)
     parser.add_argument("--test_gender", type=str)
-    parser.add_argument(
-        "-m", "--model", type=str,
-    )
+    parser.add_argument("-m", "--model", type=str)
     parser.add_argument("-e", "--epochs", type=int)
     parser.add_argument("-bs", "--batch_size", type=int)
     parser.add_argument("-lr", "--learning_rate", type=float)
@@ -63,14 +48,12 @@ def parse_args():
     parser.set_defaults(**config)
     args = parser.parse_args()
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     return args
 
 
 def train_epoch(
     net,
-    teacher_net,                 # <<< 新增
     train_loader,
     loss_fn,
     optimizer,
@@ -79,8 +62,7 @@ def train_epoch(
     total_epochs,
     tqdm_able,
 ):
-    """One training epoch.
-    """
+    """One training epoch."""
     net.train()
     sample_count = 0
     running_loss = 0.0
@@ -95,7 +77,6 @@ def train_epoch(
 
     loss_s_sum = 0.0
     loss_c_sum = 0.0
-    kd_loss_sum = 0.0          # <<< 新增：统计 KD loss
 
     # ====== ES-Mamba: 控制 EvidenceSelector 的 tau / hard ======
     core_net = net.module if isinstance(net, torch.nn.DataParallel) else net
@@ -109,14 +90,10 @@ def train_epoch(
     tau_min = 0.5
     tau_now = max(tau_min, tau0 * math.exp(-0.05 * current_epoch))
 
-    # 更新 audio selector
     if hasattr(core_net, "audio_selector"):
         core_net.audio_selector.hard = use_hard
         core_net.audio_selector.tau = tau_now
     # =======================================================
-
-    # KD 系数（这个 epoch 整体共用一份）
-    lambda_kd = get_lambda_kd(current_epoch) if teacher_net is not None else 0.0
 
     with tqdm(
         train_loader,
@@ -128,19 +105,8 @@ def train_epoch(
         for x, y, mask in pbar:
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
 
-            # -------- Teacher / Student 前向 --------
-            if (teacher_net is not None) and (lambda_kd > 0.0):
-                # Teacher 只做前向，不求梯度
-                with torch.no_grad():
-                    t_logits, t_feat = teacher_net(x, mask, return_feat=True)
-
-                s_logits, s_feat = net(x, mask, return_feat=True)
-            else:
-                # 不做 KD，只算学生
-                s_logits = net(x, mask)
-                s_feat = None
-                t_logits = None
-                t_feat = None
+            # -------- 只保留 Student 前向（带 feat 便于后续扩展/调试）--------
+            s_logits, s_feat = net(x, mask, return_feat=True)
 
             # 兼容 DataParallel 和 单卡两种情况
             core_net = net.module if isinstance(net, torch.nn.DataParallel) else net
@@ -152,7 +118,6 @@ def train_epoch(
                 g = gate_a                           # 不 detach，用来算正则
                 g_det = g.detach()                   # 用来统计
 
-                # 每 2 个 epoch、10% 的 batch 打一次
                 if (current_epoch % 2 == 0) and (random.random() < 0.1):
                     keep_ratio = (g_det > 0.5).float().mean().item()
                     print(
@@ -164,7 +129,6 @@ def train_epoch(
                         )
                     )
 
-                # 稀疏 + 连续性正则（目前只对 audio）
                 loss_sparsity = g.mean()
                 diff = torch.abs(g[..., 1:] - g[..., :-1])
                 loss_continuity = diff.mean()
@@ -191,32 +155,19 @@ def train_epoch(
             loss_s_term = lambda_sparse * loss_sparsity
             loss_c_term = lambda_cont * loss_continuity
 
-            # ----- KD loss（feature + logit，简单 MSE）-----
-            if (teacher_net is not None) and (lambda_kd > 0.0) and (s_feat is not None):
-                # teacher / student 的 sigmoid 概率
-                p_t = torch.sigmoid(t_logits.detach())
-                p_s = torch.sigmoid(s_logits)
-
-                # 单标签二分类，用对称 KL 或者简单的 MSE 都行
-                # 版本 A：MSE
-                loss_kd = torch.mean((p_s - p_t) ** 2)
-            else:
-                loss_kd = torch.tensor(0.0, device=device)
-
             if current_epoch % 2 == 0 and random.random() < 0.05:
                 print(
                     f"[epoch {current_epoch}] "
                     f"loss_cls={loss_cls.item():.3f}, "
                     f"λ_s*Ls={loss_s_term.item():.3f}, "
-                    f"λ_c*Lc={loss_c_term.item():.3f}, "
-                    f"λ_kd*L_kd={(lambda_kd * loss_kd.item()):.3f}"
+                    f"λ_c*Lc={loss_c_term.item():.3f}"
                 )
 
-            # 总 loss
-            loss = loss_cls + loss_s_term + loss_c_term + lambda_kd * loss_kd
+            # 总 loss（无 KD）
+            loss = loss_cls + loss_s_term + loss_c_term
             loss.backward()
 
-            # ------- 统计 gate / loss_s / loss_c / loss_kd 的 epoch 均值 -------
+            # ------- 统计 gate / loss_s / loss_c 的 epoch 均值 -------
             bsz = x.size(0)
             if gate_a is not None:
                 g_det = gate_a.detach()
@@ -231,15 +182,13 @@ def train_epoch(
                 gate_v_sum += gv_det.mean().item() * bsz
                 gate_v_keep_sum += (gv_det > 0.5).float().mean().item() * bsz
 
-            kd_loss_sum += (lambda_kd * loss_kd.item()) * bsz
-
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
 
             sample_count += x.shape[0]
             running_loss += loss.item() * x.shape[0]
-            # binary classification with only one output neuron
+
             pred = (s_logits > 0.0).int()
             correct_count += (pred == y).sum().item()
 
@@ -265,8 +214,6 @@ def train_epoch(
         gate_v_mean = gate_v_keep = 0.0
         loss_s_avg = loss_c_avg = 0.0
 
-    loss_kd_avg = kd_loss_sum / sample_count if sample_count > 0 else 0.0
-
     return {
         "loss": epoch_loss,
         "acc": epoch_acc,
@@ -276,18 +223,14 @@ def train_epoch(
         "gate_v_keep": gate_v_keep,
         "loss_s": loss_s_avg,
         "loss_c": loss_c_avg,
-        "loss_kd": loss_kd_avg,     # <<< 新增
     }
 
 
-def val(
-    net, val_loader, loss_fn, device, tqdm_able
-):
-    """Test the model on the validation / test set.
-    """
+def val(net, val_loader, loss_fn, device, tqdm_able):
+    """Test the model on the validation / test set."""
     net.eval()
     sample_count = 0
-    running_loss = 0.
+    running_loss = 0.0
     TP, FP, TN, FN = 0, 0, 0, 0
 
     with torch.no_grad():
@@ -295,7 +238,6 @@ def val(
             val_loader, desc="Validating", leave=False, unit="batch", disable=tqdm_able
         ) as pbar:
             for x, y, mask in pbar:
-                # print(x.shape,y.shape)
                 x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
                 y_pred = net(x, mask)
 
@@ -303,8 +245,8 @@ def val(
 
                 sample_count += x.shape[0]
                 running_loss += loss.item() * x.shape[0]
-                # binary classification with only one output neuron
-                pred = (y_pred > 0.).int()
+
+                pred = (y_pred > 0.0).int()
                 TP += torch.sum((pred == 1) & (y == 1)).item()
                 FP += torch.sum((pred == 1) & (y == 0)).item()
                 TN += torch.sum((pred == 0) & (y == 0)).item()
@@ -314,34 +256,37 @@ def val(
                 precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
                 recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
                 f1_score = (
-                    2 * (precision * recall) / (precision + recall) 
+                    2 * (precision * recall) / (precision + recall)
                     if (precision + recall) > 0 else 0.0
                 )
-                accuracy = (
-                    (TP + TN) / sample_count
-                    if sample_count > 0 else 0.0
-                )
+                accuracy = (TP + TN) / sample_count if sample_count > 0 else 0.0
 
-                pbar.set_postfix({
-                    "loss": l, "acc": accuracy,
-                    "precision": precision, "recall": recall, "f1": f1_score,
-                })
+                pbar.set_postfix(
+                    {
+                        "loss": l,
+                        "acc": accuracy,
+                        "precision": precision,
+                        "recall": recall,
+                        "f1": f1_score,
+                    }
+                )
 
     l = running_loss / sample_count
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
     f1_score = (
-        2 * (precision * recall) / (precision + recall) 
+        2 * (precision * recall) / (precision + recall)
         if (precision + recall) > 0 else 0.0
     )
-    accuracy = (
-        (TP + TN) / sample_count
-        if sample_count > 0 else 0.0
-    )
+    accuracy = (TP + TN) / sample_count if sample_count > 0 else 0.0
     return {
-        "loss": l, "acc": accuracy,
-        "precision": precision, "recall": recall, "f1": f1_score,
+        "loss": l,
+        "acc": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1_score,
     }
+
 
 # ====== ES-Mamba: 稀疏 / 连续性正则的 warm-up 系数 ======
 def get_lambda_sparse(epoch: int) -> float:
@@ -352,7 +297,7 @@ def get_lambda_sparse(epoch: int) -> float:
     if epoch < 30:
         return 0.0
     elif epoch < 90:
-        return 0.1 * (epoch - 30) / 60.0   # 0 -> 0.1
+        return 0.1 * (epoch - 30) / 60.0  # 0 -> 0.1
     else:
         return 0.1
 
@@ -367,9 +312,13 @@ def get_lambda_cont(epoch: int) -> float:
         return 0.01
 # ========================================================
 
+
 def main():
     args = parse_args()
-    args.data_dir = os.path.join(args.data_dir,args.dataset)
+    args.data_dir = os.path.join(args.data_dir, args.dataset)
+
+    last_best_ckpt_path = None
+
     for i_iter in range(3):
         history = {
             "train_loss": [],
@@ -385,22 +334,22 @@ def main():
             "val_precision": [],
             "val_recall": [],
             "val_f1": [],
-            "train_loss_kd": [],
         }
+
         if args.if_wandb:
             wandb_run_name = f"{args.model}-{args.train_gender}-{args.test_gender}"
-            wandb.init(
-                project="mamnba_ad", config=args, name=wandb_run_name,
-            )
+            wandb.init(project="mamnba_ad", config=args, name=wandb_run_name)
             args = wandb.config
-        print(args)
-        # Build Save Dir
-        os.makedirs(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}", exist_ok=True)
-        os.makedirs(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/samples", exist_ok=True)
-        os.makedirs(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints", exist_ok=True)
 
-        # construct the model
-        # ---------- construct the student model (ES-DepMamba, use_gate=True) ----------
+        print(args)
+
+        # Build Save Dir
+        run_dir = f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}"
+        os.makedirs(run_dir, exist_ok=True)
+        os.makedirs(f"{run_dir}/samples", exist_ok=True)
+        os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
+
+        # construct the model (only student)
         if args.model == "DepMamba":
             if args.dataset == "lmvd":
                 student_cfg = dict(args.mmmamba_lmvd)
@@ -409,7 +358,7 @@ def main():
             else:
                 raise ValueError(f"Unknown dataset {args.dataset}")
 
-            student_cfg["use_gate"] = True   # 学生：打开 gate
+            student_cfg["use_gate"] = True
             net = DepMamba(**student_cfg)
         else:
             raise NotImplementedError(
@@ -420,40 +369,8 @@ def main():
         if len(args.device) > 1:
             net = torch.nn.DataParallel(net, device_ids=args.device)
 
-        # ---------- construct the teacher model (frozen, no gate) ----------
-        teacher_net = None
-        if os.path.exists(TEACHER_CKPT):
-            print(f"Loading teacher checkpoint from: {TEACHER_CKPT}")
-            if args.dataset == "lmvd":
-                teacher_cfg = dict(args.mmmamba_lmvd)
-            elif args.dataset == "dvlog":
-                teacher_cfg = dict(args.mmmamba)
-            teacher_cfg["use_gate"] = False   # Teacher：关闭 gate，走全量 DepMamba
-
-            teacher_net = DepMamba(**teacher_cfg)
-            teacher_net = teacher_net.to(args.device[0])
-            if len(args.device) > 1:
-                teacher_net = torch.nn.DataParallel(
-                    teacher_net, device_ids=args.device
-                )
-
-            state = torch.load(TEACHER_CKPT, map_location=args.device[0])
-            # 旧权重可能没有 gate 相关参数，用 strict=False 更稳一点
-            missing, unexpected = teacher_net.load_state_dict(state, strict=False)
-            print(
-                f"Teacher ckpt loaded. missing={len(missing)}, unexpected={len(unexpected)}"
-            )
-
-            for p in teacher_net.parameters():
-                p.requires_grad = False
-            teacher_net.eval()
-        else:
-            print(
-                f"[WARN] Teacher checkpoint not found at {TEACHER_CKPT}，本次训练不做 KD。"
-            )
-
         # prepare the data
-        if args.dataset=='dvlog':
+        if args.dataset == "dvlog":
             train_loader = get_dvlog_dataloader(
                 args.data_dir, "train", args.batch_size, args.train_gender
             )
@@ -463,7 +380,7 @@ def main():
             test_loader = get_dvlog_dataloader(
                 args.data_dir, "test", args.batch_size, args.test_gender
             )
-        elif args.dataset=='lmvd':
+        elif args.dataset == "lmvd":
             train_loader = get_lmvd_dataloader(
                 args.data_dir, "train", args.batch_size, args.train_gender
             )
@@ -473,26 +390,33 @@ def main():
             test_loader = get_lmvd_dataloader(
                 args.data_dir, "test", args.batch_size, args.test_gender
             )
+        else:
+            raise ValueError(f"Unknown dataset {args.dataset}")
 
         # set other training components
         loss_fn = torch.nn.BCEWithLogitsLoss()
         optimizer = torch.optim.Adam(net.parameters(), lr=args.learning_rate)
 
         best_val_acc = -1.0
-        best_test_acc = -1.0
+
         if args.train:
             for epoch in range(args.epochs):
                 train_results = train_epoch(
-                    net,teacher_net, train_loader, loss_fn, optimizer, 
-                    args.device[0], epoch, args.epochs, args.tqdm_able
+                    net,
+                    train_loader,
+                    loss_fn,
+                    optimizer,
+                    args.device[0],
+                    epoch,
+                    args.epochs,
+                    args.tqdm_able,
                 )
-                val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
-                 # ---- 记录曲线用的指标 ----
+                val_results = val(net, val_loader, loss_fn, args.device[0], args.tqdm_able)
+
                 history["train_loss"].append(float(train_results["loss"]))
                 history["train_acc"].append(float(train_results["acc"]))
                 history["train_loss_s"].append(float(train_results["loss_s"]))
                 history["train_loss_c"].append(float(train_results["loss_c"]))
-                history["train_loss_kd"].append(float(train_results["loss_kd"]))  # <<< 新增
                 history["gate_a_mean"].append(float(train_results["gate_a_mean"]))
                 history["gate_a_keep"].append(float(train_results["gate_a_keep"]))
                 history["gate_v_mean"].append(float(train_results["gate_v_mean"]))
@@ -504,37 +428,42 @@ def main():
                 history["val_recall"].append(float(val_results["recall"]))
                 history["val_f1"].append(float(val_results["f1"]))
 
-                val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
+                val_acc = (
+                    val_results["acc"]
+                    + val_results["precision"]
+                    + val_results["recall"]
+                    + val_results["f1"]
+                ) / 4.0
+
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
-                    torch.save(net.state_dict(),f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
+                    best_ckpt_path = f"{run_dir}/checkpoints/best_model.pt"
+                    torch.save(net.state_dict(), best_ckpt_path)
+                    last_best_ckpt_path = best_ckpt_path
 
                 if args.if_wandb:
-                    wandb.log({
-                        "loss/train": train_results["loss"],
-                        "acc/train": train_results["acc"],
-                        "loss/val": val_results["loss"],
-                        "acc/val": val_results["acc"],
-                        "precision/val": val_results["precision"],
-                        "recall/val": val_results["recall"],
-                        "f1/val": val_results["f1"]
-                    })
-            
-        # upload the best model to wandb website
+                    wandb.log(
+                        {
+                            "loss/train": train_results["loss"],
+                            "acc/train": train_results["acc"],
+                            "loss/val": val_results["loss"],
+                            "acc/val": val_results["acc"],
+                            "precision/val": val_results["precision"],
+                            "recall/val": val_results["recall"],
+                            "f1/val": val_results["f1"],
+                        }
+                    )
+
         # load the best model for testing
         with torch.no_grad():
-            net.load_state_dict(
-                torch.load(
-                    f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt",
-                    map_location=args.device[0],
-                )
-            )
+            best_ckpt_path = f"{run_dir}/checkpoints/best_model.pt"
+            net.load_state_dict(torch.load(best_ckpt_path, map_location=args.device[0]))
             net.eval()
+
             test_results = val(net, test_loader, loss_fn, args.device[0], args.tqdm_able)
             print("Test results:")
             print(test_results)
 
-            # -------- 保存 test 结果到 txt --------
             avg_score = (
                 test_results["acc"]
                 + test_results["precision"]
@@ -542,7 +471,7 @@ def main():
                 + test_results["f1"]
             ) / 4.0
 
-            results_path = f'./results/{args.dataset}_{args.model}_{str(i_iter)}.txt'
+            results_path = f"./results/{args.dataset}_{args.model}_{str(i_iter)}.txt"
             os.makedirs(os.path.dirname(results_path), exist_ok=True)
             with open(results_path, "w") as f:
                 test_result_str = (
@@ -550,32 +479,24 @@ def main():
                     f'Precision:{test_results["precision"]}, '
                     f'Recall:{test_results["recall"]}, '
                     f'F1:{test_results["f1"]}, '
-                    f'Avg:{avg_score}'
+                    f"Avg:{avg_score}"
                 )
                 f.write(test_result_str)
 
-            # -------- 保存本次 run 的曲线数据（放到当前 run 的目录里）--------
-            run_dir = f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}"
             curve_path = os.path.join(run_dir, "curves.json")
             with open(curve_path, "w") as f_json:
                 json.dump(history, f_json, indent=2)
             print("Curve stats saved to:", curve_path, flush=True)
 
-
     if args.if_wandb:
-        artifact = wandb.Artifact("best_model", type="model")
-        artifact.add_file(f"{args.save_dir}/{args.model}/checkpoints/best_model.pt")
-        wandb.run.summary["acc/best_val_acc"] = best_val_acc
-        wandb.log_artifact(artifact)
-        wandb.run.summary["acc/test_acc"] = test_results["acc"]
-        wandb.run.summary["loss/test_loss"] = test_results["loss"]
-        wandb.run.summary["precision/test_precision"] = test_results["precision"]
-        wandb.run.summary["recall/test_recall"] = test_results["recall"]
-        wandb.run.summary["f1/test_f1"] = test_results["f1"]
+        if last_best_ckpt_path is not None and os.path.exists(last_best_ckpt_path):
+            artifact = wandb.Artifact("best_model", type="model")
+            artifact.add_file(last_best_ckpt_path)
+            wandb.log_artifact(artifact)
 
         wandb.finish()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     setup_seed(2000)
     main()
