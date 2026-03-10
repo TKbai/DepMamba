@@ -8,6 +8,7 @@ import math
 
 import wandb
 import torch
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 
@@ -112,6 +113,68 @@ def get_lambda_cont(epoch: int) -> float:
     else:
         return 0.005
 
+def get_lambda_mil(epoch: int) -> float:
+    # 先 warm-up，避免一开始 selector 还没成型就被 proposal-style loss 拉偏
+    if epoch < 10:
+        return 0.0
+    elif epoch < 30:
+        return 0.05
+    else:
+        return 0.1
+
+
+def get_lambda_comp_aux(epoch: int) -> float:
+    if epoch < 10:
+        return 0.0
+    else:
+        return 0.02
+
+
+def masked_topk_mean(score_map, valid_mask=None, topk_ratio=0.1):
+    """
+    score_map: (B,1,L)
+    valid_mask: (B,L), 1=valid
+    return: (B,1)
+    """
+    s = score_map.squeeze(1)   # (B,L)
+    B, L = s.shape
+    bag_scores = []
+
+    for i in range(B):
+        if valid_mask is None:
+            cur = s[i]
+        else:
+            cur = s[i][valid_mask[i].bool()]
+
+        if cur.numel() == 0:
+            bag_scores.append(torch.zeros((), device=s.device, dtype=s.dtype))
+            continue
+
+        k = max(1, int(math.ceil(cur.numel() * topk_ratio)))
+        topk_vals = torch.topk(cur, k=k, dim=-1).values
+        bag_scores.append(topk_vals.mean())
+
+    return torch.stack(bag_scores, dim=0).unsqueeze(1)  # (B,1)
+
+
+def topk_mil_loss(score_map, labels, valid_mask=None, topk_ratio=0.1):
+    """
+    用 evidence score 的 top-k 聚合做 bag-level BCE
+    """
+    bag_logits = masked_topk_mean(score_map, valid_mask, topk_ratio)
+    return F.binary_cross_entropy_with_logits(bag_logits, labels.float())
+
+
+def completeness_aux_loss(raw_score, comp_score, labels, valid_mask=None, topk_ratio=0.1):
+    """
+    轻量 completeness:
+    只在高 evidence 区域强调 completeness
+    """
+    # 用 raw evidence 的 sigmoid 作为权重，detach 避免互相拖拽太厉害
+    weighted_comp = comp_score * torch.sigmoid(raw_score.detach())
+    bag_logits = masked_topk_mean(weighted_comp, valid_mask, topk_ratio)
+    return F.binary_cross_entropy_with_logits(bag_logits, labels.float())
+
 
 def train_epoch(
     net,
@@ -166,6 +229,15 @@ def train_epoch(
             core_net = get_core_model(net)
             gate_a = getattr(core_net, "last_audio_gate", None)  # (B,1,T) or None
             gate_v = getattr(core_net, "last_video_gate", None)  # (B,1,T) or None
+            
+            aux_a = None
+            aux_v = None
+
+            if getattr(core_net, "audio_selector", None) is not None:
+                aux_a = getattr(core_net.audio_selector, "last_aux", None)
+
+            if getattr(core_net, "video_selector", None) is not None:
+                aux_v = getattr(core_net.video_selector, "last_aux", None)
 
             # ====== 对称 gate 正则 ======
             loss_sparsity = torch.tensor(0.0, device=device)
@@ -202,18 +274,56 @@ def train_epoch(
 
             lambda_sparse = get_lambda_sparse(current_epoch)
             lambda_cont = get_lambda_cont(current_epoch)
+            lambda_mil = get_lambda_mil(current_epoch)
+            lambda_comp_aux = get_lambda_comp_aux(current_epoch)
 
             loss_cls = loss_fn(s_logits, y.to(torch.float32))
             loss_s_term = lambda_sparse * loss_sparsity
             loss_c_term = lambda_cont * loss_continuity
-            loss = loss_cls + loss_s_term + loss_c_term
+
+            # ===== proposal-aware ASG v2: top-k MIL + completeness aux =====
+            loss_mil = torch.tensor(0.0, device=device)
+            loss_comp_aux = torch.tensor(0.0, device=device)
+            num_aux_terms = 0
+
+            if aux_a is not None and "final_score" in aux_a:
+                loss_mil = loss_mil + topk_mil_loss(
+                    aux_a["final_score"], y, mask, topk_ratio=0.1
+                )
+                loss_comp_aux = loss_comp_aux + completeness_aux_loss(
+                    aux_a["raw_score"], aux_a["comp_score"], y, mask, topk_ratio=0.1
+                )
+                num_aux_terms += 1
+
+            if aux_v is not None and "final_score" in aux_v:
+                loss_mil = loss_mil + topk_mil_loss(
+                    aux_v["final_score"], y, mask, topk_ratio=0.1
+                )
+                loss_comp_aux = loss_comp_aux + completeness_aux_loss(
+                    aux_v["raw_score"], aux_v["comp_score"], y, mask, topk_ratio=0.1
+                )
+                num_aux_terms += 1
+
+            if num_aux_terms > 0:
+                loss_mil = loss_mil / num_aux_terms
+                loss_comp_aux = loss_comp_aux / num_aux_terms
+            else:
+                loss_mil = torch.tensor(0.0, device=device)
+                loss_comp_aux = torch.tensor(0.0, device=device)
+
+            loss_mil_term = lambda_mil * loss_mil
+            loss_comp_term = lambda_comp_aux * loss_comp_aux
+
+            loss = loss_cls + loss_s_term + loss_c_term + loss_mil_term + loss_comp_term
 
             if current_epoch % 2 == 0 and random.random() < 0.05:
                 print(
                     f"[epoch {current_epoch}] "
                     f"loss_cls={loss_cls.item():.3f}, "
                     f"λ_s*Ls={loss_s_term.item():.3f}, "
-                    f"λ_c*Lc={loss_c_term.item():.3f}"
+                    f"λ_c*Lc={loss_c_term.item():.3f}, "
+                    f"λ_mil*Lm={loss_mil_term.item():.3f}, "
+                    f"λ_comp*Lcomp={loss_comp_term.item():.3f}"
                 )
 
             loss.backward()
@@ -274,6 +384,8 @@ def train_epoch(
         "gate_v_keep": gate_v_keep,
         "loss_s": loss_s_avg,
         "loss_c": loss_c_avg,
+        "loss_mil": loss_mil_term.item() if sample_count > 0 else 0.0,
+        "loss_comp_aux": loss_comp_term.item() if sample_count > 0 else 0.0,
     }
 
 
@@ -357,6 +469,8 @@ def main():
             "train_acc": [],
             "train_loss_s": [],
             "train_loss_c": [],
+            "train_loss_mil": [],
+            "train_loss_comp_aux": [],
             "gate_a_mean": [],
             "gate_a_keep": [],
             "gate_v_mean": [],
@@ -455,6 +569,8 @@ def main():
                 history["train_acc"].append(float(train_results["acc"]))
                 history["train_loss_s"].append(float(train_results["loss_s"]))
                 history["train_loss_c"].append(float(train_results["loss_c"]))
+                history["train_loss_mil"].append(float(train_results["loss_mil"]))
+                history["train_loss_comp_aux"].append(float(train_results["loss_comp_aux"]))
                 history["gate_a_mean"].append(float(train_results["gate_a_mean"]))
                 history["gate_a_keep"].append(float(train_results["gate_a_keep"]))
                 history["gate_v_mean"].append(float(train_results["gate_v_mean"]))

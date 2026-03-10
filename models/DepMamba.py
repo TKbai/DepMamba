@@ -346,7 +346,7 @@ class DepMamba(BaseNet):
         # downsampling
         # ---------------------------
 
-        self.attn_stride = 8   # 先用 8，后面不稳可以改成 16
+        self.attn_stride = 4   # 先用 8，后面不稳可以改成 16
         self.attn_pool = nn.MaxPool1d(
             kernel_size=self.attn_stride,
             stride=self.attn_stride,
