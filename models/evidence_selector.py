@@ -1,53 +1,54 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 
 class EvidenceSelector(nn.Module):
     """
-    输入:  x ∈ (B, D, L)  —— Batch, Dim, Time
-    输出:  gate ∈ (B, 1, L) —— 每个时间步的保留概率
+    输入:
+        x: (B, D, L)
+    输出:
+        gate:   (B, 1, L)
+        logits: (B, 2, L)
     """
-    def __init__(self, d_in, d_hidden=128, tau=1.0, hard=False):
+    def __init__(self, d_in, d_hidden=128, tau=1.0, hard=False, use_gumbel=False):
         super().__init__()
         self.conv1 = nn.Conv1d(d_in, d_hidden, kernel_size=3, padding=1)
-        self.relu = nn.ReLU()
-        self.conv2 = nn.Conv1d(d_hidden, 2, kernel_size=1)  # 2 类：keep / drop
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(d_hidden, 2, kernel_size=1)  # drop / keep
 
         self.tau = tau
         self.hard = hard
+        self.use_gumbel = use_gumbel
+
+        nn.init.kaiming_uniform_(self.conv1.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.conv1.bias)
+        nn.init.kaiming_uniform_(self.conv2.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.conv2.bias)
 
     def forward(self, x):
         # x: (B, D, L)
-        h = self.relu(self.conv1(x))       # (B, d_hidden, L)
-        logits = self.conv2(h)             # (B, 2, L)
+        h = self.relu(self.conv1(x))
+        logits = self.conv2(h)                    # (B, 2, L)
         logits = torch.clamp(logits, min=-10.0, max=10.0)
 
-        # 变成 (B, L, 2) 以便在最后一维上做 softmax
-        logits_t = logits.permute(0, 2, 1)  # (B, L, 2)
+        logits_t = logits.permute(0, 2, 1)       # (B, L, 2)
 
-        # Gumbel-Softmax
-        y = F.gumbel_softmax(
-            logits_t, tau=self.tau, hard=self.hard, dim=-1
-        )                                   # (B, L, 2)
+        if self.use_gumbel:
+            probs = F.gumbel_softmax(
+                logits_t, tau=self.tau, hard=self.hard, dim=-1
+            )                                     # (B, L, 2)
+        else:
+            probs = F.softmax(logits_t, dim=-1)   # 更稳定
 
-        # 取“keep”那一列作为 gate 概率
-        gate = y[..., 1]                    # (B, L)
-        gate = gate.unsqueeze(1)            # (B, 1, L)
-
+        gate = probs[..., 1].unsqueeze(1)         # (B, 1, L)
         return gate, logits
 
-class VideoSelector(nn.Module):
-    """
-    Slave gate for the visual stream.
 
-    输入:
-        x: (B, D, L)，D 是通道维，L 是时间步。
-    输出:
-        gate:   (B, 1, L) 经过 Sigmoid 的软门
-        logits: (B, 1, L) 未归一化的 logit
-    """
+# 这版新 DepMamba 已经不再需要 VideoSelector 了
+# 你可以先保留这个类不删，但主路径里不要再用它
+class VideoSelector(nn.Module):
     def __init__(self, d_in: int, d_hidden: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -56,7 +57,6 @@ class VideoSelector(nn.Module):
             nn.Conv1d(d_hidden, 1, kernel_size=3, padding=1),
         )
 
-        # 简单初始化
         for m in self.net:
             if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
@@ -64,10 +64,7 @@ class VideoSelector(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor):
-        """
-        x: (B, D, L)
-        """
-        logits = self.net(x)          # (B, 1, L)
+        logits = self.net(x)
         logits = torch.clamp(logits, min=-10.0, max=10.0)
-        gate = torch.sigmoid(logits)  # (B, 1, L)
+        gate = torch.sigmoid(logits)
         return gate, logits

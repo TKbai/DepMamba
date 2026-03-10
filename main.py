@@ -1,15 +1,16 @@
 import argparse
 import os
 import yaml
-import math
 import json
+import inspect
+import random
+import math
 
 import wandb
 import torch
+import numpy as np
 from tqdm import tqdm
 
-import random
-import numpy as np
 from models import DepMamba
 from datasets import get_dvlog_dataloader, get_lmvd_dataloader
 
@@ -23,15 +24,22 @@ def setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False  # 禁止自动寻找最优算子
+    torch.backends.cudnn.benchmark = False
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
 
 def parse_args():
     with open(CONFIG_PATH, "r") as f:
         config = yaml.safe_load(f)
 
     parser = argparse.ArgumentParser(description="Train and test a model.")
-    # arguments whose default values are in config.yaml
     parser.add_argument("--data_dir", type=str)
     parser.add_argument("--train_gender", type=str)
     parser.add_argument("--test_gender", type=str)
@@ -41,15 +49,68 @@ def parse_args():
     parser.add_argument("-lr", "--learning_rate", type=float)
     parser.add_argument("-ds", "--dataset", type=str)
     parser.add_argument("-g", "--gpu", type=str)
-    parser.add_argument("-wdb", "--if_wandb", type=bool)
-    parser.add_argument("-tqdm", "--tqdm_able", type=bool)
-    parser.add_argument("-tr", "--train", type=bool)
+    parser.add_argument("-wdb", "--if_wandb", type=str2bool)
+    parser.add_argument("-tqdm", "--tqdm_able", type=str2bool)
+    parser.add_argument("-tr", "--train", type=str2bool)
     parser.add_argument("-d", "--device", type=str, nargs="*")
     parser.set_defaults(**config)
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     return args
+
+
+def get_core_model(net):
+    return net.module if isinstance(net, torch.nn.DataParallel) else net
+
+
+def sanitize_depmamba_cfg(cfg: dict):
+    """
+    兼容旧 config 和新 DepMamba.__init__ 的字段。
+    如果新模型没有某些旧字段，就自动忽略。
+    """
+    cfg = dict(cfg)
+
+    # 兼容旧字段名
+    if "mm_output_sizes" in cfg and "uni_output_sizes" not in cfg:
+        cfg["uni_output_sizes"] = cfg["mm_output_sizes"]
+
+    # 如果你想让 fusion_output_sizes 也可由 config 控制，这里优先保留 config 原值
+    if "fusion_output_sizes" not in cfg:
+        cfg["fusion_output_sizes"] = [128]
+
+    # 默认打开 gate
+    if "use_gate" not in cfg:
+        cfg["use_gate"] = False
+
+    # selector / attention 默认值
+    cfg.setdefault("selector_tau", 1.0)
+    cfg.setdefault("selector_hard", False)
+    cfg.setdefault("selector_alpha", 0.5)
+    cfg.setdefault("attn_heads", 1)
+
+    # 过滤掉新 DepMamba 不接受的参数
+    valid_params = set(inspect.signature(DepMamba.__init__).parameters.keys())
+    valid_params.discard("self")
+    cfg = {k: v for k, v in cfg.items() if k in valid_params}
+
+    return cfg
+
+
+def get_lambda_sparse(epoch: int) -> float:
+    if epoch < 30:
+        return 0.0
+    elif epoch < 90:
+        return 0.05 * (epoch - 30) / 60.0
+    else:
+        return 0.05
+
+
+def get_lambda_cont(epoch: int) -> float:
+    if epoch < 30:
+        return 0.0
+    else:
+        return 0.005
 
 
 def train_epoch(
@@ -62,13 +123,19 @@ def train_epoch(
     total_epochs,
     tqdm_able,
 ):
-    """One training epoch."""
     net.train()
+    core_net = get_core_model(net)
+
+    # 新版本 selector 默认走确定性 soft gate
+    if hasattr(core_net, "audio_selector") and hasattr(core_net.audio_selector, "use_gumbel"):
+        core_net.audio_selector.use_gumbel = False
+    if hasattr(core_net, "video_selector") and hasattr(core_net.video_selector, "use_gumbel"):
+        core_net.video_selector.use_gumbel = False
+
     sample_count = 0
     running_loss = 0.0
     correct_count = 0
 
-    # --- 为画曲线准备的一些 epoch 级统计 ---
     gate_a_sum = 0.0
     gate_a_keep_sum = 0.0
     gate_v_sum = 0.0
@@ -78,82 +145,68 @@ def train_epoch(
     loss_s_sum = 0.0
     loss_c_sum = 0.0
 
-    # ====== ES-Mamba: 控制 EvidenceSelector 的 tau / hard ======
-    core_net = net.module if isinstance(net, torch.nn.DataParallel) else net
-
-    # 1) soft->hard curriculum：前 30 个 epoch 一律 hard=False
-    hard_start_epoch = 99999
-    use_hard = current_epoch >= hard_start_epoch
-
-    # 2) tau 退火：从 3.0 慢慢降到 0.5，别再往下了
-    tau0 = 3.0
-    tau_min = 0.5
-    tau_now = max(tau_min, tau0 * math.exp(-0.05 * current_epoch))
-
-    if hasattr(core_net, "audio_selector"):
-        core_net.audio_selector.hard = use_hard
-        core_net.audio_selector.tau = tau_now
-    # =======================================================
-
     with tqdm(
         train_loader,
         desc=f"Training epoch {current_epoch}/{total_epochs}",
         leave=False,
         unit="batch",
-        disable=tqdm_able,
+        disable=not tqdm_able,
     ) as pbar:
         for x, y, mask in pbar:
-            x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
+            x = x.to(device)
+            y = y.to(device).unsqueeze(1)
+            mask = mask.to(device)
+            
 
-            # -------- 只保留 Student 前向（带 feat 便于后续扩展/调试）--------
+            optimizer.zero_grad(set_to_none=True)
+
+            # 新版 DepMamba 仍支持 return_feat=True -> (logits, feat)
             s_logits, s_feat = net(x, mask, return_feat=True)
 
-            # 兼容 DataParallel 和 单卡两种情况
-            core_net = net.module if isinstance(net, torch.nn.DataParallel) else net
-            gate_a = getattr(core_net, "last_audio_gate", None)  # (B, 1, L) or None
-            gate_v = getattr(core_net, "last_video_gate", None)  # (B, 1, L) or None
+            core_net = get_core_model(net)
+            gate_a = getattr(core_net, "last_audio_gate", None)  # (B,1,T) or None
+            gate_v = getattr(core_net, "last_video_gate", None)  # (B,1,T) or None
 
-            # ====== audio gate：打印 + 正则 ======
+            # ====== 对称 gate 正则 ======
+            loss_sparsity = torch.tensor(0.0, device=device)
+            loss_continuity = torch.tensor(0.0, device=device)
+
+            num_gate_terms = 0
+
             if gate_a is not None:
-                g = gate_a                           # 不 detach，用来算正则
-                g_det = g.detach()                   # 用来统计
+                ga = gate_a
+                ga_det = ga.detach()
 
-                if (current_epoch % 2 == 0) and (random.random() < 0.1):
-                    keep_ratio = (g_det > 0.5).float().mean().item()
-                    print(
-                        "[audio] gate stats: mean={:.3f}, min={:.3f}, max={:.3f}, keep@0.5={:.3f}".format(
-                            g_det.mean().item(),
-                            g_det.min().item(),
-                            g_det.max().item(),
-                            keep_ratio,
-                        )
-                    )
 
-                loss_sparsity = g.mean()
-                diff = torch.abs(g[..., 1:] - g[..., :-1])
-                loss_continuity = diff.mean()
+
+                loss_sparsity = loss_sparsity + ga.mean()
+                loss_continuity = loss_continuity + torch.abs(ga[..., 1:] - ga[..., :-1]).mean()
+                num_gate_terms += 1
+
+            if gate_v is not None:
+                gv = gate_v
+                gv_det = gv.detach()
+
+
+
+                loss_sparsity = loss_sparsity + gv.mean()
+                loss_continuity = loss_continuity + torch.abs(gv[..., 1:] - gv[..., :-1]).mean()
+                num_gate_terms += 1
+
+            if num_gate_terms > 0:
+                loss_sparsity = loss_sparsity / num_gate_terms
+                loss_continuity = loss_continuity / num_gate_terms
             else:
                 loss_sparsity = torch.tensor(0.0, device=device)
                 loss_continuity = torch.tensor(0.0, device=device)
 
-            # ====== video gate：只打印，不进 loss ======
-            if gate_v is not None and (current_epoch % 2 == 0) and (random.random() < 0.1):
-                gv = gate_v.detach()
-                keep_ratio_v = (gv > 0.5).float().mean().item()
-                print(
-                    "[video] gate stats: mean={:.3f}, min={:.3f}, max={:.3f}, keep@0.5={:.3f}".format(
-                        gv.mean().item(),
-                        gv.min().item(),
-                        gv.max().item(),
-                        keep_ratio_v,
-                    )
-                )
-
             lambda_sparse = get_lambda_sparse(current_epoch)
             lambda_cont = get_lambda_cont(current_epoch)
+
             loss_cls = loss_fn(s_logits, y.to(torch.float32))
             loss_s_term = lambda_sparse * loss_sparsity
             loss_c_term = lambda_cont * loss_continuity
+            loss = loss_cls + loss_s_term + loss_c_term
 
             if current_epoch % 2 == 0 and random.random() < 0.05:
                 print(
@@ -163,18 +216,17 @@ def train_epoch(
                     f"λ_c*Lc={loss_c_term.item():.3f}"
                 )
 
-            # 总 loss（无 KD）
-            loss = loss_cls + loss_s_term + loss_c_term
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+            optimizer.step()
 
-            # ------- 统计 gate / loss_s / loss_c 的 epoch 均值 -------
+            # ------- 统计 -------
             bsz = x.size(0)
+
             if gate_a is not None:
-                g_det = gate_a.detach()
-                gate_a_sum += g_det.mean().item() * bsz
-                gate_a_keep_sum += (g_det > 0.5).float().mean().item() * bsz
-                loss_s_sum += loss_s_term.item() * bsz
-                loss_c_sum += loss_c_term.item() * bsz
+                ga_det = gate_a.detach()
+                gate_a_sum += ga_det.mean().item() * bsz
+                gate_a_keep_sum += (ga_det > 0.5).float().mean().item() * bsz
                 gate_count += bsz
 
             if gate_v is not None:
@@ -182,12 +234,11 @@ def train_epoch(
                 gate_v_sum += gv_det.mean().item() * bsz
                 gate_v_keep_sum += (gv_det > 0.5).float().mean().item() * bsz
 
-            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
+            loss_s_sum += loss_s_term.item() * bsz
+            loss_c_sum += loss_c_term.item() * bsz
 
-            sample_count += x.shape[0]
-            running_loss += loss.item() * x.shape[0]
+            sample_count += bsz
+            running_loss += loss.item() * bsz
 
             pred = (s_logits > 0.0).int()
             correct_count += (pred == y).sum().item()
@@ -207,12 +258,12 @@ def train_epoch(
         gate_a_keep = gate_a_keep_sum / gate_count
         gate_v_mean = gate_v_sum / gate_count
         gate_v_keep = gate_v_keep_sum / gate_count
-        loss_s_avg = loss_s_sum / gate_count
-        loss_c_avg = loss_c_sum / gate_count
     else:
         gate_a_mean = gate_a_keep = 0.0
         gate_v_mean = gate_v_keep = 0.0
-        loss_s_avg = loss_c_avg = 0.0
+
+    loss_s_avg = loss_s_sum / sample_count if sample_count > 0 else 0.0
+    loss_c_avg = loss_c_sum / sample_count if sample_count > 0 else 0.0
 
     return {
         "loss": epoch_loss,
@@ -227,7 +278,6 @@ def train_epoch(
 
 
 def val(net, val_loader, loss_fn, device, tqdm_able):
-    """Test the model on the validation / test set."""
     net.eval()
     sample_count = 0
     running_loss = 0.0
@@ -235,10 +285,17 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
 
     with torch.no_grad():
         with tqdm(
-            val_loader, desc="Validating", leave=False, unit="batch", disable=tqdm_able
+            val_loader,
+            desc="Validating",
+            leave=False,
+            unit="batch",
+            disable=not tqdm_able,
         ) as pbar:
             for x, y, mask in pbar:
-                x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
+                x = x.to(device)
+                y = y.to(device).unsqueeze(1)
+                mask = mask.to(device)
+
                 y_pred = net(x, mask)
 
                 loss = loss_fn(y_pred, y.to(torch.float32))
@@ -288,31 +345,6 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
     }
 
 
-# ====== ES-Mamba: 稀疏 / 连续性正则的 warm-up 系数 ======
-def get_lambda_sparse(epoch: int) -> float:
-    """
-    稀疏正则：前 30 epoch 不加，
-    30~90 线性升到 0.1，之后保持 0.1。
-    """
-    if epoch < 30:
-        return 0.0
-    elif epoch < 90:
-        return 0.1 * (epoch - 30) / 60.0  # 0 -> 0.1
-    else:
-        return 0.1
-
-
-def get_lambda_cont(epoch: int) -> float:
-    """
-    连续性正则：力度再小一点，只做“平滑”，别主导训练。
-    """
-    if epoch < 30:
-        return 0.0
-    else:
-        return 0.01
-# ========================================================
-
-
 def main():
     args = parse_args()
     args.data_dir = os.path.join(args.data_dir, args.dataset)
@@ -343,13 +375,12 @@ def main():
 
         print(args)
 
-        # Build Save Dir
         run_dir = f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}"
         os.makedirs(run_dir, exist_ok=True)
         os.makedirs(f"{run_dir}/samples", exist_ok=True)
         os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
 
-        # construct the model (only student)
+        # ===== construct model =====
         if args.model == "DepMamba":
             if args.dataset == "lmvd":
                 student_cfg = dict(args.mmmamba_lmvd)
@@ -358,7 +389,7 @@ def main():
             else:
                 raise ValueError(f"Unknown dataset {args.dataset}")
 
-            student_cfg["use_gate"] = True
+            student_cfg = sanitize_depmamba_cfg(student_cfg)
             net = DepMamba(**student_cfg)
         else:
             raise NotImplementedError(
@@ -369,7 +400,7 @@ def main():
         if len(args.device) > 1:
             net = torch.nn.DataParallel(net, device_ids=args.device)
 
-        # prepare the data
+        # ===== prepare data =====
         if args.dataset == "dvlog":
             train_loader = get_dvlog_dataloader(
                 args.data_dir, "train", args.batch_size, args.train_gender
@@ -393,7 +424,6 @@ def main():
         else:
             raise ValueError(f"Unknown dataset {args.dataset}")
 
-        # set other training components
         loss_fn = torch.nn.BCEWithLogitsLoss()
         optimizer = torch.optim.Adam(net.parameters(), lr=args.learning_rate)
 
@@ -412,6 +442,14 @@ def main():
                     args.tqdm_able,
                 )
                 val_results = val(net, val_loader, loss_fn, args.device[0], args.tqdm_able)
+                print(
+                    f"[Epoch {epoch:03d}] "
+                    f"train_loss={train_results['loss']:.4f}, "
+                    f"train_acc={train_results['acc']:.4f}, "
+                    f"val_loss={val_results['loss']:.4f}, "
+                    f"val_acc={val_results['acc']:.4f}, "
+                    f"val_f1={val_results['f1']:.4f}"
+                )
 
                 history["train_loss"].append(float(train_results["loss"]))
                 history["train_acc"].append(float(train_results["acc"]))
@@ -438,7 +476,7 @@ def main():
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     best_ckpt_path = f"{run_dir}/checkpoints/best_model.pt"
-                    torch.save(net.state_dict(), best_ckpt_path)
+                    torch.save(get_core_model(net).state_dict(), best_ckpt_path)
                     last_best_ckpt_path = best_ckpt_path
 
                 if args.if_wandb:
@@ -446,6 +484,12 @@ def main():
                         {
                             "loss/train": train_results["loss"],
                             "acc/train": train_results["acc"],
+                            "loss/train_s": train_results["loss_s"],
+                            "loss/train_c": train_results["loss_c"],
+                            "gate/audio_mean": train_results["gate_a_mean"],
+                            "gate/audio_keep": train_results["gate_a_keep"],
+                            "gate/video_mean": train_results["gate_v_mean"],
+                            "gate/video_keep": train_results["gate_v_keep"],
                             "loss/val": val_results["loss"],
                             "acc/val": val_results["acc"],
                             "precision/val": val_results["precision"],
@@ -454,12 +498,16 @@ def main():
                         }
                     )
 
-        # load the best model for testing
-        with torch.no_grad():
-            best_ckpt_path = f"{run_dir}/checkpoints/best_model.pt"
-            net.load_state_dict(torch.load(best_ckpt_path, map_location=args.device[0]))
-            net.eval()
+        # ===== load best model for testing =====
+        best_ckpt_path = f"{run_dir}/checkpoints/best_model.pt"
+        if not os.path.exists(best_ckpt_path):
+            raise FileNotFoundError(f"Best checkpoint not found: {best_ckpt_path}")
 
+        core_net = get_core_model(net)
+        core_net.load_state_dict(torch.load(best_ckpt_path, map_location=args.device[0]))
+        core_net.eval()
+
+        with torch.no_grad():
             test_results = val(net, test_loader, loss_fn, args.device[0], args.tqdm_able)
             print("Test results:")
             print(test_results)
@@ -498,5 +546,5 @@ def main():
 
 
 if __name__ == "__main__":
-    setup_seed(2000)
+    setup_seed(2222)
     main()
