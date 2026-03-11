@@ -97,6 +97,14 @@ def sanitize_depmamba_cfg(cfg: dict):
 
     return cfg
 
+def get_dataset_train_cfg(args):
+    if args.dataset == "lmvd":
+        return getattr(args, "lmvd_train", {})
+    elif args.dataset == "dvlog":
+        return getattr(args, "dvlog_train", {})
+    else:
+        return {}
+
 
 def get_lambda_sparse(epoch: int) -> float:
     if epoch < 30:
@@ -113,21 +121,31 @@ def get_lambda_cont(epoch: int) -> float:
     else:
         return 0.005
 
-def get_lambda_mil(epoch: int) -> float:
-    # 先 warm-up，避免一开始 selector 还没成型就被 proposal-style loss 拉偏
-    if epoch < 10:
+def get_lambda_mil(epoch: int, total_epochs: int, peak: float) -> float:
+    # 前期 warm-up，中期保持，后期衰减
+    if epoch < 5:
         return 0.0
-    elif epoch < 30:
-        return 0.05
+    elif epoch < 20:
+        return peak * (epoch - 5) / 15.0
+    elif epoch < int(0.65 * total_epochs):
+        return peak
     else:
-        return 0.1
+        decay_len = total_epochs - int(0.65 * total_epochs)
+        remain = total_epochs - epoch
+        return peak * max(0.0, remain / max(1, decay_len))
 
 
-def get_lambda_comp_aux(epoch: int) -> float:
-    if epoch < 10:
+def get_lambda_comp_aux(epoch: int, total_epochs: int, peak: float) -> float:
+    if epoch < 5:
         return 0.0
+    elif epoch < 20:
+        return peak * (epoch - 5) / 15.0
+    elif epoch < int(0.65 * total_epochs):
+        return peak
     else:
-        return 0.02
+        decay_len = total_epochs - int(0.65 * total_epochs)
+        remain = total_epochs - epoch
+        return peak * max(0.0, remain / max(1, decay_len))
 
 
 def masked_topk_mean(score_map, valid_mask=None, topk_ratio=0.1):
@@ -274,8 +292,17 @@ def train_epoch(
 
             lambda_sparse = get_lambda_sparse(current_epoch)
             lambda_cont = get_lambda_cont(current_epoch)
-            lambda_mil = get_lambda_mil(current_epoch)
-            lambda_comp_aux = get_lambda_comp_aux(current_epoch)
+            lambda_mil = get_lambda_mil(
+                current_epoch,
+                total_epochs,
+                peak=getattr(core_net, "lambda_mil_peak", 0.1),
+            )
+
+            lambda_comp_aux = get_lambda_comp_aux(
+                current_epoch,
+                total_epochs,
+                peak=getattr(core_net, "lambda_comp_peak", 0.02),
+            )
 
             loss_cls = loss_fn(s_logits, y.to(torch.float32))
             loss_s_term = lambda_sparse * loss_sparsity
@@ -461,6 +488,20 @@ def main():
     args = parse_args()
     args.data_dir = os.path.join(args.data_dir, args.dataset)
 
+    train_cfg = get_dataset_train_cfg(args)
+
+    if "epochs" in train_cfg:
+        args.epochs = int(train_cfg["epochs"])
+    else:
+        args.epochs = int(args.epochs)
+
+    if "learning_rate" in train_cfg:
+        args.learning_rate = float(train_cfg["learning_rate"])
+    else:
+        args.learning_rate = float(args.learning_rate)
+
+    args.batch_size = int(args.batch_size)
+
     last_best_ckpt_path = None
 
     for i_iter in range(3):
@@ -509,10 +550,19 @@ def main():
             raise NotImplementedError(
                 f"The {args.model} method has not been implemented by this repo"
             )
+        
+        train_cfg = get_dataset_train_cfg(args)
+
+        lambda_mil_peak = float(train_cfg.get("lambda_mil_peak", 0.10))
+        lambda_comp_peak = float(train_cfg.get("lambda_comp_peak", 0.02))
 
         net = net.to(args.device[0])
         if len(args.device) > 1:
             net = torch.nn.DataParallel(net, device_ids=args.device)
+        
+        core_net = get_core_model(net) if isinstance(net, torch.nn.DataParallel) else net
+        core_net.lambda_mil_peak = lambda_mil_peak
+        core_net.lambda_comp_peak = lambda_comp_peak
 
         # ===== prepare data =====
         if args.dataset == "dvlog":
@@ -539,7 +589,14 @@ def main():
             raise ValueError(f"Unknown dataset {args.dataset}")
 
         loss_fn = torch.nn.BCEWithLogitsLoss()
-        optimizer = torch.optim.Adam(net.parameters(), lr=args.learning_rate)
+        train_cfg = get_dataset_train_cfg(args)
+        weight_decay = float(train_cfg.get("weight_decay", 0.0))
+
+        optimizer = torch.optim.Adam(
+            net.parameters(),
+            lr=args.learning_rate,
+            weight_decay=weight_decay,
+        )
 
         best_val_acc = -1.0
 
@@ -582,15 +639,10 @@ def main():
                 history["val_recall"].append(float(val_results["recall"]))
                 history["val_f1"].append(float(val_results["f1"]))
 
-                val_acc = (
-                    val_results["acc"]
-                    + val_results["precision"]
-                    + val_results["recall"]
-                    + val_results["f1"]
-                ) / 4.0
+                val_metric = val_results["f1"]
 
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
+                if val_metric > best_val_acc:
+                    best_val_acc = val_metric
                     best_ckpt_path = f"{run_dir}/checkpoints/best_model.pt"
                     torch.save(get_core_model(net).state_dict(), best_ckpt_path)
                     last_best_ckpt_path = best_ckpt_path
@@ -662,5 +714,5 @@ def main():
 
 
 if __name__ == "__main__":
-    setup_seed(2222)
+    setup_seed(3333)
     main()

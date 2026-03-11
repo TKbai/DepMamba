@@ -3,52 +3,81 @@ train_gender: both
 test_gender: both
 
 model: DepMamba
-dataset: dvlog #dvlog or lmvd
+dataset: dvlog   # 默认值，可被 launch.json 覆盖
 train: true
 tqdm_able: true
 epochs: 120
 batch_size: 16
-learning_rate: 4e-5
+learning_rate: 1e-5
 
 if_wandb: false
 save_dir: "/home/ac/data/bai/DepMamba-main/savefile/"
 device:
   - "cuda"
 
-# Mamba parameters
+# ---------------------------
+# dataset-specific training cfg
+# ---------------------------
+dvlog_train:
+  epochs: 120
+  learning_rate: 1e-5
+  weight_decay: 0.0
+  early_stop_patience: 999
+  lambda_mil_peak: 0.10
+  lambda_comp_peak: 0.020
+
+lmvd_train:
+  epochs: 60
+  learning_rate: 1e-5
+  weight_decay: 1.0e-4
+  early_stop_patience: 12
+  lambda_mil_peak: 0.04
+  lambda_comp_peak: 0.008
+
+# ---------------------------
+# D-Vlog model cfg
+# ---------------------------
 mmmamba:
-  audio_input_size: 25 # LDDs for D-Vlog
+  audio_input_size: 25
   video_input_size: 136
   mm_input_size: 256
   mm_output_sizes: [256]
+  fusion_output_sizes: [128]
   dropout: 0.1
-  d_ffn: 1024 
+  d_ffn: 1024
   num_layers: 1
   selector_alpha: 0.7
-  activation: 'GELU'
+  activation: "GELU"
   use_gate: true
   causal: false
+  attn_heads: 1
 
   mamba_config:
-    d_state: 12 
-    expand: 4 
-    d_conv: 4 
+    d_state: 12
+    expand: 4
+    d_conv: 4
     bidirectional: false
 
+# ---------------------------
+# LMVD model cfg
+# ---------------------------
 mmmamba_lmvd:
-  audio_input_size: 128 # VGGish for LMVD
+  audio_input_size: 128
   video_input_size: 136
-  mm_input_size: 256
+  mm_input_size: 192
   mm_output_sizes: [256]
-  dropout: 0.1
-  d_ffn: 1024 
+  fusion_output_sizes: [128]
+  dropout: 0.2
+  d_ffn: 1024
   num_layers: 1
-  activation: 'GELU'
+  selector_alpha: 0.8
+  activation: "GELU"
   use_gate: true
   causal: false
+  attn_heads: 1
 
   mamba_config:
-    d_state: 16 
-    expand: 4 
-    d_conv: 4 
-    bidirectional: false   
+    d_state: 16
+    expand: 2
+    d_conv: 4
+    bidirectional: false

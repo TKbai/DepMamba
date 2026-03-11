@@ -31,6 +31,7 @@ Notes
    0 = padded timestep
 """
 
+import math
 import copy
 from typing import Optional, List
 
@@ -368,6 +369,10 @@ class DepMamba(BaseNet):
         )
         self.cross_beta_a = 0.1
         self.cross_beta_v = 0.1
+        # evidence-aware cross-attention
+        self.use_evidence_attn = True
+        self.attn_topk_ratio = 0.35   # 每个样本保留前 x% 的下采样 token D-vlog0,35
+        self.attn_min_tokens = 4      # 至少保留 4 个 toke D-vlog 4
 
         # ---------------------------
         # 5) post-fusion encoder
@@ -441,6 +446,95 @@ class DepMamba(BaseNet):
         denom = mask.sum(dim=1).clamp(min=1.0)
         x = (x * mask).sum(dim=1) / denom
         return x
+    
+
+
+    def _select_topk_tokens(
+        self,
+        x_ds: torch.Tensor,
+        score_ds: torch.Tensor,
+        valid_mask_ds: torch.Tensor,
+    ):
+        """
+        x_ds:         (B, T_ds, D)
+        score_ds:     (B, 1, T_ds)
+        valid_mask_ds:(B, T_ds) bool
+        返回:
+            sel_x:    (B, K_max, D)
+            sel_valid:(B, K_max) bool
+            sel_idx:  (B, K_max) long
+        """
+        B, T_ds, D = x_ds.shape
+        device = x_ds.device
+
+        idx_list = []
+        k_list = []
+        max_k = 1
+
+        for b in range(B):
+            valid_idx = torch.nonzero(valid_mask_ds[b], as_tuple=False).squeeze(-1)
+
+            if valid_idx.numel() == 0:
+                idx = torch.zeros(1, dtype=torch.long, device=device)
+                k = 0
+            else:
+                cur_scores = score_ds[b, 0, valid_idx]  # (valid_len,)
+                valid_len = cur_scores.numel()
+
+                k = max(self.attn_min_tokens, int(math.ceil(valid_len * self.attn_topk_ratio)))
+                k = min(k, valid_len)
+
+                topk_local = torch.topk(cur_scores, k=k, dim=-1).indices
+                idx = valid_idx[topk_local]
+
+                # 很重要：恢复时间顺序，而不是按分数顺序
+                idx = torch.sort(idx).values
+
+            idx_list.append(idx)
+            k_list.append(k)
+            max_k = max(max_k, max(1, k))
+
+        sel_x = torch.zeros(B, max_k, D, device=device, dtype=x_ds.dtype)
+        sel_valid = torch.zeros(B, max_k, device=device, dtype=torch.bool)
+        sel_idx = torch.zeros(B, max_k, device=device, dtype=torch.long)
+
+        for b in range(B):
+            k = k_list[b]
+            if k > 0:
+                idx = idx_list[b]
+                sel_x[b, :k] = x_ds[b, idx]
+                sel_valid[b, :k] = True
+                sel_idx[b, :k] = idx
+
+        return sel_x, sel_valid, sel_idx
+
+
+    def _scatter_selected_tokens(
+        self,
+        base_shape_tensor: torch.Tensor,
+        updates: torch.Tensor,
+        sel_idx: torch.Tensor,
+        sel_valid: torch.Tensor,
+    ):
+        """
+        把 top-k attention 输出 scatter 回原下采样时间轴
+        base_shape_tensor: 仅用于提供目标 shape，通常传 xa_ds / xv_ds
+        updates:  (B, K_max, D)
+        sel_idx:  (B, K_max)
+        sel_valid:(B, K_max)
+        返回:
+            out: (B, T_ds, D)
+        """
+        out = torch.zeros_like(base_shape_tensor)
+
+        B = out.size(0)
+        for b in range(B):
+            k = int(sel_valid[b].sum().item())
+            if k > 0:
+                out[b, sel_idx[b, :k]] = updates[b, :k]
+
+        return out
+    
 
     # -----------------------------------------------------
     # main feature extractor
@@ -491,40 +585,107 @@ class DepMamba(BaseNet):
             xa = xa * valid
             xv = xv * valid
 
-        # 5) lightweight MulT on downsampled sequences (single direction)
-        # 先对时间维降采样，再做 cross-attention，避免长序列 O(T^2) 不稳定
-
+        # 5) evidence-aware lightweight MulT on downsampled sequences
         xa_ds = self.attn_pool(xa.permute(0, 2, 1)).permute(0, 2, 1)  # (B, T_ds, D)
         xv_ds = self.attn_pool(xv.permute(0, 2, 1)).permute(0, 2, 1)  # (B, T_ds, D)
 
         if padding_mask is not None:
-            # 窗口里只要有一个有效位置，就认为该 downsample token 有效
             mask_ds = F.max_pool1d(
                 padding_mask.float().unsqueeze(1),
                 kernel_size=self.attn_stride,
                 stride=self.attn_stride,
                 ceil_mode=True,
             ).squeeze(1)  # (B, T_ds)
-
-            key_padding_mask_ds = ~mask_ds.bool()   # True = ignore
+            valid_mask_ds = mask_ds.bool()
         else:
-            mask_ds = None
-            key_padding_mask_ds = None
+            valid_mask_ds = torch.ones(
+                xa_ds.size(0), xa_ds.size(1), device=xa_ds.device, dtype=torch.bool
+            )
 
-        # 双向：audio <- video, video <- audio
-        xa_attn_ds = self.audio_from_video(
-            q=xa_ds,
-            kv=xv_ds,
-            key_padding_mask=key_padding_mask_ds,
-        )
+        # 默认回退：整条序列 attention
+        use_sparse_evidence_attn = False
+        score_a_ds = None
+        score_v_ds = None
 
-        xv_attn_ds = self.video_from_audio(
-            q=xv_ds,
-            kv=xa_ds,
-            key_padding_mask=key_padding_mask_ds,
-        )
+        if self.use_evidence_attn and self.use_gate:
+            aux_a = getattr(self.audio_selector, "last_aux", None)
+            aux_v = getattr(self.video_selector, "last_aux", None)
 
-        # 上采样回原始长度
+            if aux_a is not None and aux_v is not None \
+            and "final_score" in aux_a and "final_score" in aux_v:
+                score_a = aux_a["final_score"]   # (B,1,T)
+                score_v = aux_v["final_score"]   # (B,1,T)
+
+                if padding_mask is not None:
+                    valid = padding_mask.unsqueeze(1).float()
+                    score_a = score_a * valid
+                    score_v = score_v * valid
+
+                # 把 selector 的 evidence score 下采样到 attention 时间尺度
+                score_a_ds = F.max_pool1d(
+                    score_a,
+                    kernel_size=self.attn_stride,
+                    stride=self.attn_stride,
+                    ceil_mode=True,
+                )  # (B,1,T_ds)
+
+                score_v_ds = F.max_pool1d(
+                    score_v,
+                    kernel_size=self.attn_stride,
+                    stride=self.attn_stride,
+                    ceil_mode=True,
+                )  # (B,1,T_ds)
+
+                use_sparse_evidence_attn = True
+
+        if use_sparse_evidence_attn:
+            # ---- 1) 各自选择高证据 token ----
+            xa_sel, xa_sel_valid, xa_sel_idx = self._select_topk_tokens(
+                xa_ds, score_a_ds, valid_mask_ds
+            )
+            xv_sel, xv_sel_valid, xv_sel_idx = self._select_topk_tokens(
+                xv_ds, score_v_ds, valid_mask_ds
+            )
+
+            # ---- 2) 只在高证据 token 上做双向 cross-attention ----
+            xa_attn_sel = self.audio_from_video(
+                q=xa_sel,
+                kv=xv_sel,
+                key_padding_mask=~xv_sel_valid,   # True = ignore
+            )
+            xv_attn_sel = self.video_from_audio(
+                q=xv_sel,
+                kv=xa_sel,
+                key_padding_mask=~xa_sel_valid,
+            )
+
+            # 把 padded query 位置清零
+            xa_attn_sel = xa_attn_sel * xa_sel_valid.unsqueeze(-1).float()
+            xv_attn_sel = xv_attn_sel * xv_sel_valid.unsqueeze(-1).float()
+
+            # ---- 3) scatter 回原下采样时间轴 ----
+            xa_attn_ds = self._scatter_selected_tokens(
+                xa_ds, xa_attn_sel, xa_sel_idx, xa_sel_valid
+            )
+            xv_attn_ds = self._scatter_selected_tokens(
+                xv_ds, xv_attn_sel, xv_sel_idx, xv_sel_valid
+            )
+        else:
+            # 回退到你原来的 dense 双向 cross-attention
+            key_padding_mask_ds = ~valid_mask_ds  # True = ignore
+
+            xa_attn_ds = self.audio_from_video(
+                q=xa_ds,
+                kv=xv_ds,
+                key_padding_mask=key_padding_mask_ds,
+            )
+            xv_attn_ds = self.video_from_audio(
+                q=xv_ds,
+                kv=xa_ds,
+                key_padding_mask=key_padding_mask_ds,
+            )
+
+        # ---- 4) 上采样回原始长度 ----
         xa_attn = F.interpolate(
             xa_attn_ds.permute(0, 2, 1),
             size=xa.size(1),
@@ -537,7 +698,7 @@ class DepMamba(BaseNet):
             mode="nearest",
         ).permute(0, 2, 1)
 
-        # 残差式增强，不直接替换
+        # ---- 5) 残差式增强 ----
         xa_ctx = xa + self.cross_beta_a * xa_attn
         xv_ctx = xv + self.cross_beta_v * xv_attn
 
