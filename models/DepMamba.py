@@ -277,10 +277,29 @@ class DepMamba(BaseNet):
         causal: bool = False,
         mamba_config: Optional[dict] = None,
         use_gate: bool = True,
+
+        # selector
         selector_tau: float = 1.0,
         selector_hard: bool = False,
+        selector_use_gumbel: bool = False,
         selector_alpha: float = 0.5,
+        selector_comp_weight: float = 0.3,
+        selector_win_sizes: Optional[List[int]] = None,
+
+        # cross-attention
         attn_heads: int = 1,
+        use_evidence_attn: bool = True,
+        attn_stride: int = 4,
+
+        attn_topk_ratio_a: float = 0.35,
+        attn_topk_ratio_v: float = 0.35,
+        attn_min_tokens_a: int = 4,
+        attn_min_tokens_v: int = 4,
+        attn_max_tokens_a: Optional[int] = None,
+        attn_max_tokens_v: Optional[int] = None,
+
+        cross_beta_a: float = 0.1,
+        cross_beta_v: float = 0.1,
     ):
         super().__init__()
 
@@ -288,12 +307,27 @@ class DepMamba(BaseNet):
             uni_output_sizes = [256, 64]
         if fusion_output_sizes is None:
             fusion_output_sizes = [128]
+        if selector_win_sizes is None:
+            selector_win_sizes = [7, 15, 31]
 
         self.audio_input_size = audio_input_size
         self.video_input_size = video_input_size
         self.mm_input_size = mm_input_size
         self.use_gate = use_gate
         self.selector_alpha = selector_alpha
+
+        self.use_evidence_attn = use_evidence_attn
+        self.attn_stride = attn_stride
+
+        self.attn_topk_ratio_a = attn_topk_ratio_a
+        self.attn_topk_ratio_v = attn_topk_ratio_v
+        self.attn_min_tokens_a = attn_min_tokens_a
+        self.attn_min_tokens_v = attn_min_tokens_v
+        self.attn_max_tokens_a = attn_max_tokens_a
+        self.attn_max_tokens_v = attn_max_tokens_v
+
+        self.cross_beta_a = cross_beta_a
+        self.cross_beta_v = cross_beta_v
 
         # ---------------------------
         # 1) input projection
@@ -312,12 +346,18 @@ class DepMamba(BaseNet):
             d_hidden=mm_input_size,
             tau=selector_tau,
             hard=selector_hard,
+            use_gumbel=selector_use_gumbel,
+            win_sizes=selector_win_sizes,
+            comp_weight=selector_comp_weight,
         )
         self.video_selector = EvidenceSelector(
             d_in=mm_input_size,
             d_hidden=mm_input_size,
             tau=selector_tau,
             hard=selector_hard,
+            use_gumbel=selector_use_gumbel,
+            win_sizes=selector_win_sizes,
+            comp_weight=selector_comp_weight,
         )
 
         self.last_audio_gate = None
@@ -347,16 +387,12 @@ class DepMamba(BaseNet):
         # downsampling
         # ---------------------------
 
-        self.attn_stride = 4   # 先用 8，后面不稳可以改成 16
         self.attn_pool = nn.MaxPool1d(
             kernel_size=self.attn_stride,
             stride=self.attn_stride,
             ceil_mode=True,
         )
 
-        # ---------------------------
-        # 4) lightweight MulT
-        # ---------------------------
         self.audio_from_video = CrossAttentionBlock(
             d_model=d_model,
             nhead=attn_heads,
@@ -367,12 +403,6 @@ class DepMamba(BaseNet):
             nhead=attn_heads,
             dropout=0.0,
         )
-        self.cross_beta_a = 0.1
-        self.cross_beta_v = 0.1
-        # evidence-aware cross-attention
-        self.use_evidence_attn = True
-        self.attn_topk_ratio = 0.35   # 每个样本保留前 x% 的下采样 token D-vlog0,35
-        self.attn_min_tokens = 4      # 至少保留 4 个 toke D-vlog 4
 
         # ---------------------------
         # 5) post-fusion encoder
@@ -423,18 +453,26 @@ class DepMamba(BaseNet):
         Returns:
             x_reweighted: (B, T, D)
             gate: (B, 1, T)
-            logits: whatever selector returns
+            logits: (B, 2, T)
         """
-        gate, logits = selector(x.permute(0, 2, 1))  # gate: (B, 1, T)
+        gate, logits = selector(
+            x.permute(0, 2, 1),
+            padding_mask=padding_mask,
+        )  # gate: (B,1,T)
 
         if padding_mask is not None:
             valid = padding_mask.unsqueeze(1).float()  # (B,1,T)
             gate = gate * valid
+            logits = logits * valid
 
-        gate_t = gate.permute(0, 2, 1)  # (B, T, 1)
+        gate_t = gate.permute(0, 2, 1)  # (B,T,1)
 
         alpha = self.selector_alpha
         x = x * (alpha + (1.0 - alpha) * gate_t)
+
+        if padding_mask is not None:
+            x = x * padding_mask.unsqueeze(-1).float()
+
         return x, gate, logits
 
     def _masked_mean_pool(self, x: torch.Tensor, padding_mask: torch.Tensor):
@@ -454,11 +492,15 @@ class DepMamba(BaseNet):
         x_ds: torch.Tensor,
         score_ds: torch.Tensor,
         valid_mask_ds: torch.Tensor,
+        topk_ratio: float,
+        min_tokens: int,
+        max_tokens: Optional[int] = None,
     ):
         """
         x_ds:         (B, T_ds, D)
         score_ds:     (B, 1, T_ds)
         valid_mask_ds:(B, T_ds) bool
+
         返回:
             sel_x:    (B, K_max, D)
             sel_valid:(B, K_max) bool
@@ -481,13 +523,18 @@ class DepMamba(BaseNet):
                 cur_scores = score_ds[b, 0, valid_idx]  # (valid_len,)
                 valid_len = cur_scores.numel()
 
-                k = max(self.attn_min_tokens, int(math.ceil(valid_len * self.attn_topk_ratio)))
+                k = max(min_tokens, int(math.ceil(valid_len * topk_ratio)))
                 k = min(k, valid_len)
+
+                if max_tokens is not None:
+                    k = min(k, max_tokens)
+
+                k = max(1, k)
 
                 topk_local = torch.topk(cur_scores, k=k, dim=-1).indices
                 idx = valid_idx[topk_local]
 
-                # 很重要：恢复时间顺序，而不是按分数顺序
+                # 恢复时间顺序，而不是按分数顺序
                 idx = torch.sort(idx).values
 
             idx_list.append(idx)
@@ -636,15 +683,27 @@ class DepMamba(BaseNet):
                     ceil_mode=True,
                 )  # (B,1,T_ds)
 
+                score_a_ds = torch.nan_to_num(score_a_ds, nan=0.0, posinf=10.0, neginf=-10.0)
+                score_v_ds = torch.nan_to_num(score_v_ds, nan=0.0, posinf=10.0, neginf=-10.0)
+
                 use_sparse_evidence_attn = True
 
         if use_sparse_evidence_attn:
-            # ---- 1) 各自选择高证据 token ----
             xa_sel, xa_sel_valid, xa_sel_idx = self._select_topk_tokens(
-                xa_ds, score_a_ds, valid_mask_ds
+                xa_ds,
+                score_a_ds,
+                valid_mask_ds,
+                topk_ratio=self.attn_topk_ratio_a,
+                min_tokens=self.attn_min_tokens_a,
+                max_tokens=self.attn_max_tokens_a,
             )
             xv_sel, xv_sel_valid, xv_sel_idx = self._select_topk_tokens(
-                xv_ds, score_v_ds, valid_mask_ds
+                xv_ds,
+                score_v_ds,
+                valid_mask_ds,
+                topk_ratio=self.attn_topk_ratio_v,
+                min_tokens=self.attn_min_tokens_v,
+                max_tokens=self.attn_max_tokens_v,
             )
 
             # ---- 2) 只在高证据 token 上做双向 cross-attention ----

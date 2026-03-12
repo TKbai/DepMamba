@@ -106,20 +106,20 @@ def get_dataset_train_cfg(args):
         return {}
 
 
-def get_lambda_sparse(epoch: int) -> float:
+def get_lambda_sparse(epoch: int, peak: float = 0.05) -> float:
     if epoch < 30:
         return 0.0
     elif epoch < 90:
-        return 0.05 * (epoch - 30) / 60.0
+        return peak * (epoch - 30) / 60.0
     else:
-        return 0.05
+        return peak
 
 
-def get_lambda_cont(epoch: int) -> float:
+def get_lambda_cont(epoch: int, peak: float = 0.005) -> float:
     if epoch < 30:
         return 0.0
     else:
-        return 0.005
+        return peak
 
 def get_lambda_mil(epoch: int, total_epochs: int, peak: float) -> float:
     # 前期 warm-up，中期保持，后期衰减
@@ -146,6 +146,46 @@ def get_lambda_comp_aux(epoch: int, total_epochs: int, peak: float) -> float:
         decay_len = total_epochs - int(0.65 * total_epochs)
         remain = total_epochs - epoch
         return peak * max(0.0, remain / max(1, decay_len))
+
+def masked_gate_mean(gate, valid_mask=None, eps=1e-6):
+    """
+    gate: (B,1,L)
+    valid_mask: (B,L), 1=valid, 0=pad
+    """
+    g = gate.squeeze(1)  # (B,L)
+
+    if valid_mask is None:
+        return g.mean()
+
+    m = valid_mask.float()
+    num = (g * m).sum()
+    den = m.sum().clamp(min=eps)
+    return num / den
+
+
+def masked_gate_diff_mean(gate, valid_mask=None, eps=1e-6):
+    """
+    gate: (B,1,L)
+    valid_mask: (B,L), 1=valid, 0=pad
+
+    只在相邻两个位置都有效时统计连续性
+    """
+    g = gate.squeeze(1)  # (B,L)
+
+    if g.size(-1) <= 1:
+        return torch.zeros((), device=g.device, dtype=g.dtype)
+
+    diff = torch.abs(g[:, 1:] - g[:, :-1])  # (B,L-1)
+
+    if valid_mask is None:
+        return diff.mean()
+
+    m = valid_mask.float()
+    pair_mask = m[:, 1:] * m[:, :-1]  # 两侧都有效才算
+
+    num = (diff * pair_mask).sum()
+    den = pair_mask.sum().clamp(min=eps)
+    return num / den
 
 
 def masked_topk_mean(score_map, valid_mask=None, topk_ratio=0.1):
@@ -225,6 +265,8 @@ def train_epoch(
 
     loss_s_sum = 0.0
     loss_c_sum = 0.0
+    loss_mil_sum = 0.0
+    loss_comp_sum = 0.0
 
     with tqdm(
         train_loader,
@@ -257,7 +299,7 @@ def train_epoch(
             if getattr(core_net, "video_selector", None) is not None:
                 aux_v = getattr(core_net.video_selector, "last_aux", None)
 
-            # ====== 对称 gate 正则 ======
+            # ====== 对称 gate 正则（mask-aware） ======
             loss_sparsity = torch.tensor(0.0, device=device)
             loss_continuity = torch.tensor(0.0, device=device)
 
@@ -265,22 +307,14 @@ def train_epoch(
 
             if gate_a is not None:
                 ga = gate_a
-                ga_det = ga.detach()
-
-
-
-                loss_sparsity = loss_sparsity + ga.mean()
-                loss_continuity = loss_continuity + torch.abs(ga[..., 1:] - ga[..., :-1]).mean()
+                loss_sparsity = loss_sparsity + masked_gate_mean(ga, mask)
+                loss_continuity = loss_continuity + masked_gate_diff_mean(ga, mask)
                 num_gate_terms += 1
 
             if gate_v is not None:
                 gv = gate_v
-                gv_det = gv.detach()
-
-
-
-                loss_sparsity = loss_sparsity + gv.mean()
-                loss_continuity = loss_continuity + torch.abs(gv[..., 1:] - gv[..., :-1]).mean()
+                loss_sparsity = loss_sparsity + masked_gate_mean(gv, mask)
+                loss_continuity = loss_continuity + masked_gate_diff_mean(gv, mask)
                 num_gate_terms += 1
 
             if num_gate_terms > 0:
@@ -290,19 +324,27 @@ def train_epoch(
                 loss_sparsity = torch.tensor(0.0, device=device)
                 loss_continuity = torch.tensor(0.0, device=device)
 
-            lambda_sparse = get_lambda_sparse(current_epoch)
-            lambda_cont = get_lambda_cont(current_epoch)
+            lambda_sparse = get_lambda_sparse(
+                current_epoch,
+                peak=getattr(core_net, "lambda_sparse_peak", 0.05),
+            )
+            lambda_cont = get_lambda_cont(
+                current_epoch,
+                peak=getattr(core_net, "lambda_cont_peak", 0.005),
+            )
             lambda_mil = get_lambda_mil(
                 current_epoch,
                 total_epochs,
                 peak=getattr(core_net, "lambda_mil_peak", 0.1),
             )
-
             lambda_comp_aux = get_lambda_comp_aux(
                 current_epoch,
                 total_epochs,
                 peak=getattr(core_net, "lambda_comp_peak", 0.02),
             )
+
+            mil_topk_ratio = getattr(core_net, "mil_topk_ratio", 0.1)
+            comp_topk_ratio = getattr(core_net, "comp_topk_ratio", 0.1)
 
             loss_cls = loss_fn(s_logits, y.to(torch.float32))
             loss_s_term = lambda_sparse * loss_sparsity
@@ -315,19 +357,19 @@ def train_epoch(
 
             if aux_a is not None and "final_score" in aux_a:
                 loss_mil = loss_mil + topk_mil_loss(
-                    aux_a["final_score"], y, mask, topk_ratio=0.1
+                    aux_a["final_score"], y, mask, topk_ratio=mil_topk_ratio
                 )
                 loss_comp_aux = loss_comp_aux + completeness_aux_loss(
-                    aux_a["raw_score"], aux_a["comp_score"], y, mask, topk_ratio=0.1
+                    aux_a["raw_score"], aux_a["comp_score"], y, mask, topk_ratio=comp_topk_ratio
                 )
                 num_aux_terms += 1
 
             if aux_v is not None and "final_score" in aux_v:
                 loss_mil = loss_mil + topk_mil_loss(
-                    aux_v["final_score"], y, mask, topk_ratio=0.1
+                    aux_v["final_score"], y, mask, topk_ratio=mil_topk_ratio
                 )
                 loss_comp_aux = loss_comp_aux + completeness_aux_loss(
-                    aux_v["raw_score"], aux_v["comp_score"], y, mask, topk_ratio=0.1
+                    aux_v["raw_score"], aux_v["comp_score"], y, mask, topk_ratio=comp_topk_ratio
                 )
                 num_aux_terms += 1
 
@@ -373,6 +415,8 @@ def train_epoch(
 
             loss_s_sum += loss_s_term.item() * bsz
             loss_c_sum += loss_c_term.item() * bsz
+            loss_mil_sum += loss_mil_term.item() * bsz
+            loss_comp_sum += loss_comp_term.item() * bsz
 
             sample_count += bsz
             running_loss += loss.item() * bsz
@@ -401,6 +445,8 @@ def train_epoch(
 
     loss_s_avg = loss_s_sum / sample_count if sample_count > 0 else 0.0
     loss_c_avg = loss_c_sum / sample_count if sample_count > 0 else 0.0
+    loss_mil_avg = loss_mil_sum / sample_count if sample_count > 0 else 0.0
+    loss_comp_avg = loss_comp_sum / sample_count if sample_count > 0 else 0.0
 
     return {
         "loss": epoch_loss,
@@ -411,8 +457,8 @@ def train_epoch(
         "gate_v_keep": gate_v_keep,
         "loss_s": loss_s_avg,
         "loss_c": loss_c_avg,
-        "loss_mil": loss_mil_term.item() if sample_count > 0 else 0.0,
-        "loss_comp_aux": loss_comp_term.item() if sample_count > 0 else 0.0,
+        "loss_mil": loss_mil_avg,
+        "loss_comp_aux": loss_comp_avg,
     }
 
 
@@ -504,7 +550,7 @@ def main():
 
     last_best_ckpt_path = None
 
-    for i_iter in range(3):
+    for i_iter in range(1):
         history = {
             "train_loss": [],
             "train_acc": [],
@@ -553,16 +599,26 @@ def main():
         
         train_cfg = get_dataset_train_cfg(args)
 
+        lambda_sparse_peak = float(train_cfg.get("lambda_sparse_peak", 0.05))
+        lambda_cont_peak = float(train_cfg.get("lambda_cont_peak", 0.005))
         lambda_mil_peak = float(train_cfg.get("lambda_mil_peak", 0.10))
         lambda_comp_peak = float(train_cfg.get("lambda_comp_peak", 0.02))
+
+        mil_topk_ratio = float(train_cfg.get("mil_topk_ratio", 0.10))
+        comp_topk_ratio = float(train_cfg.get("comp_topk_ratio", 0.10))
+        early_stop_patience = int(train_cfg.get("early_stop_patience", 999999))
 
         net = net.to(args.device[0])
         if len(args.device) > 1:
             net = torch.nn.DataParallel(net, device_ids=args.device)
         
         core_net = get_core_model(net) if isinstance(net, torch.nn.DataParallel) else net
+        core_net.lambda_sparse_peak = lambda_sparse_peak
+        core_net.lambda_cont_peak = lambda_cont_peak
         core_net.lambda_mil_peak = lambda_mil_peak
         core_net.lambda_comp_peak = lambda_comp_peak
+        core_net.mil_topk_ratio = mil_topk_ratio
+        core_net.comp_topk_ratio = comp_topk_ratio
 
         # ===== prepare data =====
         if args.dataset == "dvlog":
@@ -598,7 +654,8 @@ def main():
             weight_decay=weight_decay,
         )
 
-        best_val_acc = -1.0
+        best_val_f1 = -1.0
+        epochs_no_improve = 0
 
         if args.train:
             for epoch in range(args.epochs):
@@ -641,11 +698,15 @@ def main():
 
                 val_metric = val_results["f1"]
 
-                if val_metric > best_val_acc:
-                    best_val_acc = val_metric
+                if val_metric > best_val_f1:
+                    best_val_f1 = val_metric
+                    epochs_no_improve = 0
+
                     best_ckpt_path = f"{run_dir}/checkpoints/best_model.pt"
                     torch.save(get_core_model(net).state_dict(), best_ckpt_path)
                     last_best_ckpt_path = best_ckpt_path
+                else:
+                    epochs_no_improve += 1
 
                 if args.if_wandb:
                     wandb.log(
@@ -665,6 +726,13 @@ def main():
                             "f1/val": val_results["f1"],
                         }
                     )
+                
+                if epochs_no_improve >= early_stop_patience:
+                    print(
+                        f"Early stopping triggered at epoch {epoch:03d} "
+                        f"(patience={early_stop_patience}, best_val_f1={best_val_f1:.4f})"
+                    )
+                    break
 
         # ===== load best model for testing =====
         best_ckpt_path = f"{run_dir}/checkpoints/best_model.pt"

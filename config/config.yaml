@@ -23,16 +23,28 @@ dvlog_train:
   learning_rate: 1e-5
   weight_decay: 0.0
   early_stop_patience: 999
+
+  lambda_sparse_peak: 0.05
+  lambda_cont_peak: 0.005
   lambda_mil_peak: 0.10
   lambda_comp_peak: 0.020
+
+  mil_topk_ratio: 0.10
+  comp_topk_ratio: 0.10
 
 lmvd_train:
   epochs: 60
   learning_rate: 1e-5
   weight_decay: 1.0e-4
   early_stop_patience: 12
+
+  lambda_sparse_peak: 0.05
+  lambda_cont_peak: 0.005
   lambda_mil_peak: 0.04
   lambda_comp_peak: 0.008
+
+  mil_topk_ratio: 0.10
+  comp_topk_ratio: 0.10
 
 # ---------------------------
 # D-Vlog model cfg
@@ -44,13 +56,30 @@ mmmamba:
   mm_output_sizes: [256]
   fusion_output_sizes: [128]
   dropout: 0.1
-  d_ffn: 1024
-  num_layers: 1
+
   selector_alpha: 0.7
-  activation: "GELU"
+  selector_tau: 1.0
+  selector_hard: false
+  selector_use_gumbel: false
+  selector_comp_weight: 0.3
+  selector_win_sizes: [7, 15, 31]
+
   use_gate: true
   causal: false
   attn_heads: 1
+
+  use_evidence_attn: true
+  attn_stride: 4
+
+  attn_topk_ratio_a: 0.35
+  attn_topk_ratio_v: 0.35
+  attn_min_tokens_a: 4
+  attn_min_tokens_v: 4
+  attn_max_tokens_a: 24
+  attn_max_tokens_v: 24
+
+  cross_beta_a: 0.1
+  cross_beta_v: 0.1
 
   mamba_config:
     d_state: 12
@@ -68,13 +97,30 @@ mmmamba_lmvd:
   mm_output_sizes: [256]
   fusion_output_sizes: [128]
   dropout: 0.2
-  d_ffn: 1024
-  num_layers: 1
+
   selector_alpha: 0.8
-  activation: "GELU"
+  selector_tau: 1.0
+  selector_hard: false
+  selector_use_gumbel: false
+  selector_comp_weight: 0.3
+  selector_win_sizes: [7, 15, 31]
+
   use_gate: true
   causal: false
   attn_heads: 1
+
+  use_evidence_attn: true
+  attn_stride: 4
+
+  attn_topk_ratio_a: 0.35
+  attn_topk_ratio_v: 0.35
+  attn_min_tokens_a: 4
+  attn_min_tokens_v: 4
+  attn_max_tokens_a: null
+  attn_max_tokens_v: null
+
+  cross_beta_a: 0.1
+  cross_beta_v: 0.1
 
   mamba_config:
     d_state: 16
