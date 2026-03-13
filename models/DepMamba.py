@@ -286,6 +286,26 @@ class DepMamba(BaseNet):
         selector_comp_weight: float = 0.3,
         selector_win_sizes: Optional[List[int]] = None,
 
+        selector_use_native_proposals: bool = True,
+        selector_proposal_hidden_dim: Optional[int] = None,
+        selector_proposal_score_type: str = "linear",
+
+        selector_enable_proposals: bool = False,
+        selector_build_proposals_in_train: bool = False,
+        selector_proposal_win_sizes: Optional[List[int]] = None,
+        selector_proposal_stride_ratio: float = 0.5,
+        selector_proposal_comp_weight: float = 0.3,
+        selector_max_proposals: Optional[int] = None,
+
+        # proposal-level attention
+        proposal_attn_topk_ratio_a: float = 0.2,
+        proposal_attn_topk_ratio_v: float = 0.2,
+        proposal_attn_min_props_a: int = 2,
+        proposal_attn_min_props_v: int = 2,
+        proposal_attn_max_props_a: Optional[int] = 8,
+        proposal_attn_max_props_v: Optional[int] = 8,
+        proposal_pooling: str = "mean",
+
         # cross-attention
         attn_heads: int = 1,
         use_evidence_attn: bool = True,
@@ -300,6 +320,15 @@ class DepMamba(BaseNet):
 
         cross_beta_a: float = 0.1,
         cross_beta_v: float = 0.1,
+
+        # final pooling
+        final_pooling: str = "mean_plus_proposal",
+        proposal_cls_topk_ratio_a: float = 0.2,
+        proposal_cls_topk_ratio_v: float = 0.2,
+        proposal_cls_min_props_a: int = 2,
+        proposal_cls_min_props_v: int = 2,
+        proposal_cls_max_props_a: Optional[int] = 6,
+        proposal_cls_max_props_v: Optional[int] = 6,
     ):
         super().__init__()
 
@@ -309,6 +338,8 @@ class DepMamba(BaseNet):
             fusion_output_sizes = [128]
         if selector_win_sizes is None:
             selector_win_sizes = [7, 15, 31]
+        if selector_proposal_win_sizes is None:
+            selector_proposal_win_sizes = [8, 16, 32]
 
         self.audio_input_size = audio_input_size
         self.video_input_size = video_input_size
@@ -328,6 +359,22 @@ class DepMamba(BaseNet):
 
         self.cross_beta_a = cross_beta_a
         self.cross_beta_v = cross_beta_v
+
+        self.proposal_attn_topk_ratio_a = proposal_attn_topk_ratio_a
+        self.proposal_attn_topk_ratio_v = proposal_attn_topk_ratio_v
+        self.proposal_attn_min_props_a = proposal_attn_min_props_a
+        self.proposal_attn_min_props_v = proposal_attn_min_props_v
+        self.proposal_attn_max_props_a = proposal_attn_max_props_a
+        self.proposal_attn_max_props_v = proposal_attn_max_props_v
+        self.proposal_pooling = proposal_pooling
+
+        self.final_pooling = final_pooling
+        self.proposal_cls_topk_ratio_a = proposal_cls_topk_ratio_a
+        self.proposal_cls_topk_ratio_v = proposal_cls_topk_ratio_v
+        self.proposal_cls_min_props_a = proposal_cls_min_props_a
+        self.proposal_cls_min_props_v = proposal_cls_min_props_v
+        self.proposal_cls_max_props_a = proposal_cls_max_props_a
+        self.proposal_cls_max_props_v = proposal_cls_max_props_v
 
         # ---------------------------
         # 1) input projection
@@ -349,6 +396,17 @@ class DepMamba(BaseNet):
             use_gumbel=selector_use_gumbel,
             win_sizes=selector_win_sizes,
             comp_weight=selector_comp_weight,
+
+            proposal_win_sizes=selector_proposal_win_sizes,
+            proposal_stride_ratio=selector_proposal_stride_ratio,
+            proposal_comp_weight=selector_proposal_comp_weight,
+            max_proposals=selector_max_proposals,
+            enable_proposals=selector_enable_proposals,
+            build_proposals_in_train=selector_build_proposals_in_train,
+
+            use_native_proposals=selector_use_native_proposals,
+            proposal_hidden_dim=selector_proposal_hidden_dim,
+            proposal_score_type=selector_proposal_score_type,
         )
         self.video_selector = EvidenceSelector(
             d_in=mm_input_size,
@@ -358,6 +416,17 @@ class DepMamba(BaseNet):
             use_gumbel=selector_use_gumbel,
             win_sizes=selector_win_sizes,
             comp_weight=selector_comp_weight,
+
+            proposal_win_sizes=selector_proposal_win_sizes,
+            proposal_stride_ratio=selector_proposal_stride_ratio,
+            proposal_comp_weight=selector_proposal_comp_weight,
+            max_proposals=selector_max_proposals,
+            enable_proposals=selector_enable_proposals,
+            build_proposals_in_train=selector_build_proposals_in_train,
+
+            use_native_proposals=selector_use_native_proposals,
+            proposal_hidden_dim=selector_proposal_hidden_dim,
+            proposal_score_type=selector_proposal_score_type,
         )
 
         self.last_audio_gate = None
@@ -419,7 +488,12 @@ class DepMamba(BaseNet):
         # 6) classifier
         # ---------------------------
         self.pool = nn.AdaptiveMaxPool1d(1)
-        self.output = nn.Linear(fusion_output_sizes[-1], 1)
+
+        cls_in_dim = fusion_output_sizes[-1]
+        if self.final_pooling == "mean_plus_proposal":
+            cls_in_dim = fusion_output_sizes[-1] * 2
+
+        self.output = nn.Linear(cls_in_dim, 1)
 
     # -----------------------------------------------------
     # helper functions
@@ -581,7 +655,295 @@ class DepMamba(BaseNet):
                 out[b, sel_idx[b, :k]] = updates[b, :k]
 
         return out
+
+    def _select_topk_proposals(
+        self,
+        proposal_scores: torch.Tensor,
+        proposal_valid_mask: torch.Tensor,
+        topk_ratio: float,
+        min_props: int,
+        max_props: Optional[int] = None,
+    ):
+        """
+        proposal_scores:     (B, N)
+        proposal_valid_mask: (B, N) bool
+
+        返回:
+            sel_idx:   (B, K_max) long
+            sel_valid: (B, K_max) bool
+        """
+        B, N = proposal_scores.shape
+        device = proposal_scores.device
+
+        idx_list = []
+        k_list = []
+        max_k = 1
+
+        for b in range(B):
+            valid_idx = torch.nonzero(proposal_valid_mask[b], as_tuple=False).squeeze(-1)
+
+            if valid_idx.numel() == 0:
+                idx = torch.zeros(1, dtype=torch.long, device=device)
+                k = 0
+            else:
+                cur_scores = proposal_scores[b, valid_idx]
+                valid_len = cur_scores.numel()
+
+                k = max(min_props, int(math.ceil(valid_len * topk_ratio)))
+                k = min(k, valid_len)
+
+                if max_props is not None:
+                    k = min(k, max_props)
+
+                k = max(1, k)
+
+                topk_local = torch.topk(cur_scores, k=k, dim=-1).indices
+                idx = valid_idx[topk_local]
+
+                idx = torch.sort(idx).values
+
+            idx_list.append(idx)
+            k_list.append(k)
+            max_k = max(max_k, max(1, k))
+
+        sel_idx = torch.zeros(B, max_k, device=device, dtype=torch.long)
+        sel_valid = torch.zeros(B, max_k, device=device, dtype=torch.bool)
+
+        for b in range(B):
+            k = k_list[b]
+            if k > 0:
+                sel_idx[b, :k] = idx_list[b]
+                sel_valid[b, :k] = True
+
+        return sel_idx, sel_valid
+
+    def _pool_proposals(
+        self,
+        x: torch.Tensor,
+        proposal_spans: torch.Tensor,
+        sel_idx: torch.Tensor,
+        sel_valid: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        x:            (B, T, D)
+        proposal_spans:(B, N, 2)  [start, end)
+        sel_idx:      (B, K_max)
+        sel_valid:    (B, K_max) bool
+        padding_mask: (B, T) or None
+
+        返回:
+            prop_feat:  (B, K_max, D)
+            prop_valid: (B, K_max) bool
+            prop_spans: (B, K_max, 2)
+        """
+        B, T, D = x.shape
+        K_max = sel_idx.size(1)
+        device = x.device
+
+        prop_feat = torch.zeros(B, K_max, D, device=device, dtype=x.dtype)
+        prop_valid = sel_valid.clone()
+        prop_spans = torch.zeros(B, K_max, 2, device=device, dtype=torch.long)
+
+        for b in range(B):
+            for j in range(K_max):
+                if not sel_valid[b, j]:
+                    continue
+
+                idx = sel_idx[b, j].item()
+                start = int(proposal_spans[b, idx, 0].item())
+                end = int(proposal_spans[b, idx, 1].item())
+
+                start = max(0, min(start, T))
+                end = max(start + 1, min(end, T))
+
+                seg = x[b, start:end]  # (len, D)
+
+                if padding_mask is not None:
+                    m = padding_mask[b, start:end].float()  # (len,)
+                    den = m.sum()
+                    if den.item() < 0.5:
+                        prop_valid[b, j] = False
+                        continue
+
+                    if self.proposal_pooling == "mean":
+                        pooled = (seg * m.unsqueeze(-1)).sum(dim=0) / den.clamp(min=1.0)
+                    else:
+                        pooled = (seg * m.unsqueeze(-1)).sum(dim=0) / den.clamp(min=1.0)
+                else:
+                    pooled = seg.mean(dim=0)
+
+                prop_feat[b, j] = pooled
+                prop_spans[b, j, 0] = start
+                prop_spans[b, j, 1] = end
+
+        return prop_feat, prop_valid, prop_spans
+
+    def _scatter_proposals_to_sequence(
+        self,
+        base_x: torch.Tensor,
+        prop_updates: torch.Tensor,
+        prop_valid: torch.Tensor,
+        prop_spans: torch.Tensor,
+    ):
+        """
+        base_x:      (B, T, D)  仅用于提供目标 shape
+        prop_updates:(B, K, D)
+        prop_valid:  (B, K) bool
+        prop_spans:  (B, K, 2)
+
+        返回:
+            seq_out: (B, T, D)
+        """
+        B, T, D = base_x.shape
+        device = base_x.device
+
+        seq_out = torch.zeros(B, T, D, device=device, dtype=base_x.dtype)
+        seq_cnt = torch.zeros(B, T, 1, device=device, dtype=base_x.dtype)
+
+        for b in range(B):
+            for j in range(prop_updates.size(1)):
+                if not prop_valid[b, j]:
+                    continue
+
+                start = int(prop_spans[b, j, 0].item())
+                end = int(prop_spans[b, j, 1].item())
+
+                start = max(0, min(start, T))
+                end = max(start + 1, min(end, T))
+
+                seq_out[b, start:end] += prop_updates[b, j].unsqueeze(0)
+                seq_cnt[b, start:end] += 1.0
+
+        seq_out = seq_out / seq_cnt.clamp(min=1.0)
+        return seq_out
+
+    def _get_native_proposal_aux(self, aux: Optional[dict]):
+        """
+        只接受 native proposal selector 产生的 proposal。
+        如果 proposal 来自 fallback point-derived 路径，直接返回 None。
+        """
+        if aux is None:
+            return None
+
+        if not aux.get("uses_native_proposals", False):
+            return None
+
+        proposal_scores = aux.get("proposal_scores", None)
+        proposal_spans = aux.get("proposal_spans", None)
+        proposal_valid_mask = aux.get("proposal_valid_mask", None)
+
+        if proposal_scores is None or proposal_spans is None or proposal_valid_mask is None:
+            return None
+
+        return {
+            "proposal_scores": proposal_scores,
+            "proposal_spans": proposal_spans,
+            "proposal_valid_mask": proposal_valid_mask,
+            "proposal_scale_ids": aux.get("proposal_scale_ids", None),
+            "proposal_feats": aux.get("proposal_feats", None),
+        }
+
+    def _selected_proposals_to_time_mask(
+        self,
+        seq_len: int,
+        proposal_spans: torch.Tensor,
+        sel_idx: torch.Tensor,
+        sel_valid: torch.Tensor,
+        device,
+    ):
+        """
+        proposal_spans: (B, N, 2)
+        sel_idx:        (B, K)
+        sel_valid:      (B, K) bool
+
+        返回:
+            time_mask: (B, T) bool
+        """
+        B = proposal_spans.size(0)
+        time_mask = torch.zeros(B, seq_len, device=device, dtype=torch.bool)
+
+        for b in range(B):
+            for j in range(sel_idx.size(1)):
+                if not sel_valid[b, j]:
+                    continue
+
+                idx = int(sel_idx[b, j].item())
+                start = int(proposal_spans[b, idx, 0].item())
+                end = int(proposal_spans[b, idx, 1].item())
+
+                start = max(0, min(start, seq_len))
+                end = max(start + 1, min(end, seq_len))
+
+                time_mask[b, start:end] = True
+
+        return time_mask
     
+    def _proposal_guided_pooling(
+        self,
+        x_fused: torch.Tensor,
+        aux_a: Optional[dict],
+        aux_v: Optional[dict],
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        x_fused: (B, T, D)
+
+        返回:
+            proposal_feat: (B, D)
+            proposal_time_mask: (B, T) bool
+        """
+        B, T, D = x_fused.shape
+        device = x_fused.device
+
+        base_valid = (
+            padding_mask.bool()
+            if padding_mask is not None
+            else torch.ones(B, T, device=device, dtype=torch.bool)
+        )
+
+        proposal_mask_a = torch.zeros(B, T, device=device, dtype=torch.bool)
+        proposal_mask_v = torch.zeros(B, T, device=device, dtype=torch.bool)
+
+        native_aux_a = self._get_native_proposal_aux(aux_a)
+        native_aux_v = self._get_native_proposal_aux(aux_v)
+
+        # -------- audio proposals --------
+        if native_aux_a is not None:
+            sel_idx_a, sel_valid_a = self._select_topk_proposals(
+                native_aux_a["proposal_scores"],
+                native_aux_a["proposal_valid_mask"],
+                topk_ratio=self.proposal_cls_topk_ratio_a,
+                min_props=self.proposal_cls_min_props_a,
+                max_props=self.proposal_cls_max_props_a,
+            )
+            proposal_mask_a = self._selected_proposals_to_time_mask(
+                T, native_aux_a["proposal_spans"], sel_idx_a, sel_valid_a, device
+            )
+
+        # -------- video proposals --------
+        if native_aux_v is not None:
+            sel_idx_v, sel_valid_v = self._select_topk_proposals(
+                native_aux_v["proposal_scores"],
+                native_aux_v["proposal_valid_mask"],
+                topk_ratio=self.proposal_cls_topk_ratio_v,
+                min_props=self.proposal_cls_min_props_v,
+                max_props=self.proposal_cls_max_props_v,
+            )
+            proposal_mask_v = self._selected_proposals_to_time_mask(
+                T, native_aux_v["proposal_spans"], sel_idx_v, sel_valid_v, device
+            )
+
+        # union mask：音频 proposal ∪ 视频 proposal
+        proposal_time_mask = (proposal_mask_a | proposal_mask_v) & base_valid
+
+        # 如果一个 proposal 都没选出来，就退回全局 valid mask
+        empty_rows = proposal_time_mask.sum(dim=1) == 0
+        if empty_rows.any():
+            proposal_time_mask[empty_rows] = base_valid[empty_rows]
+
+        proposal_feat = self._masked_mean_pool(x_fused, proposal_time_mask)
+        return proposal_feat, proposal_time_mask
 
     # -----------------------------------------------------
     # main feature extractor
@@ -632,106 +994,95 @@ class DepMamba(BaseNet):
             xa = xa * valid
             xv = xv * valid
 
-        # 5) evidence-aware lightweight MulT on downsampled sequences
-        xa_ds = self.attn_pool(xa.permute(0, 2, 1)).permute(0, 2, 1)  # (B, T_ds, D)
-        xv_ds = self.attn_pool(xv.permute(0, 2, 1)).permute(0, 2, 1)  # (B, T_ds, D)
+        # 5) proposal-aware cross-attention
+        xa_attn = torch.zeros_like(xa)
+        xv_attn = torch.zeros_like(xv)
 
-        if padding_mask is not None:
-            mask_ds = F.max_pool1d(
-                padding_mask.float().unsqueeze(1),
-                kernel_size=self.attn_stride,
-                stride=self.attn_stride,
-                ceil_mode=True,
-            ).squeeze(1)  # (B, T_ds)
-            valid_mask_ds = mask_ds.bool()
-        else:
-            valid_mask_ds = torch.ones(
-                xa_ds.size(0), xa_ds.size(1), device=xa_ds.device, dtype=torch.bool
-            )
-
-        # 默认回退：整条序列 attention
-        use_sparse_evidence_attn = False
-        score_a_ds = None
-        score_v_ds = None
+        use_proposal_attn = False
 
         if self.use_evidence_attn and self.use_gate:
             aux_a = getattr(self.audio_selector, "last_aux", None)
             aux_v = getattr(self.video_selector, "last_aux", None)
 
-            if aux_a is not None and aux_v is not None \
-            and "final_score" in aux_a and "final_score" in aux_v:
-                score_a = aux_a["final_score"]   # (B,1,T)
-                score_v = aux_v["final_score"]   # (B,1,T)
+            native_aux_a = self._get_native_proposal_aux(aux_a)
+            native_aux_v = self._get_native_proposal_aux(aux_v)
 
-                if padding_mask is not None:
-                    valid = padding_mask.unsqueeze(1).float()
-                    score_a = score_a * valid
-                    score_v = score_v * valid
+            if native_aux_a is not None and native_aux_v is not None:
+                proposal_scores_a = native_aux_a["proposal_scores"]
+                proposal_scores_v = native_aux_v["proposal_scores"]
+                proposal_valid_a = native_aux_a["proposal_valid_mask"]
+                proposal_valid_v = native_aux_v["proposal_valid_mask"]
+                proposal_spans_a = native_aux_a["proposal_spans"]
+                proposal_spans_v = native_aux_v["proposal_spans"]
 
-                # 把 selector 的 evidence score 下采样到 attention 时间尺度
-                score_a_ds = F.max_pool1d(
-                    score_a,
+                # 1) 先选 top-k proposal
+                sel_idx_a, sel_valid_a = self._select_topk_proposals(
+                    proposal_scores_a,
+                    proposal_valid_a,
+                    topk_ratio=self.proposal_attn_topk_ratio_a,
+                    min_props=self.proposal_attn_min_props_a,
+                    max_props=self.proposal_attn_max_props_a,
+                )
+                sel_idx_v, sel_valid_v = self._select_topk_proposals(
+                    proposal_scores_v,
+                    proposal_valid_v,
+                    topk_ratio=self.proposal_attn_topk_ratio_v,
+                    min_props=self.proposal_attn_min_props_v,
+                    max_props=self.proposal_attn_max_props_v,
+                )
+
+                # 2) 用单模态编码后的 full-resolution feature 做 proposal pooling
+                xa_prop, xa_prop_valid, xa_prop_spans = self._pool_proposals(
+                    xa, proposal_spans_a, sel_idx_a, sel_valid_a, padding_mask=padding_mask
+                )
+                xv_prop, xv_prop_valid, xv_prop_spans = self._pool_proposals(
+                    xv, proposal_spans_v, sel_idx_v, sel_valid_v, padding_mask=padding_mask
+                )
+
+                # 3) proposal <-> proposal 双向 cross-attention
+                xa_prop_attn = self.audio_from_video(
+                    q=xa_prop,
+                    kv=xv_prop,
+                    key_padding_mask=~xv_prop_valid,
+                )
+                xv_prop_attn = self.video_from_audio(
+                    q=xv_prop,
+                    kv=xa_prop,
+                    key_padding_mask=~xa_prop_valid,
+                )
+
+                xa_prop_attn = xa_prop_attn * xa_prop_valid.unsqueeze(-1).float()
+                xv_prop_attn = xv_prop_attn * xv_prop_valid.unsqueeze(-1).float()
+
+                # 4) proposal attention 结果广播回时间轴
+                xa_attn = self._scatter_proposals_to_sequence(
+                    xa, xa_prop_attn, xa_prop_valid, xa_prop_spans
+                )
+                xv_attn = self._scatter_proposals_to_sequence(
+                    xv, xv_prop_attn, xv_prop_valid, xv_prop_spans
+                )
+
+                use_proposal_attn = True
+
+        if not use_proposal_attn:
+            # 回退：如果 proposal 还没启用，就继续用原来的 token-level sparse attention / dense attention
+            xa_ds = self.attn_pool(xa.permute(0, 2, 1)).permute(0, 2, 1)
+            xv_ds = self.attn_pool(xv.permute(0, 2, 1)).permute(0, 2, 1)
+
+            if padding_mask is not None:
+                mask_ds = F.max_pool1d(
+                    padding_mask.float().unsqueeze(1),
                     kernel_size=self.attn_stride,
                     stride=self.attn_stride,
                     ceil_mode=True,
-                )  # (B,1,T_ds)
+                ).squeeze(1)
+                valid_mask_ds = mask_ds.bool()
+            else:
+                valid_mask_ds = torch.ones(
+                    xa_ds.size(0), xa_ds.size(1), device=xa_ds.device, dtype=torch.bool
+                )
 
-                score_v_ds = F.max_pool1d(
-                    score_v,
-                    kernel_size=self.attn_stride,
-                    stride=self.attn_stride,
-                    ceil_mode=True,
-                )  # (B,1,T_ds)
-
-                score_a_ds = torch.nan_to_num(score_a_ds, nan=0.0, posinf=10.0, neginf=-10.0)
-                score_v_ds = torch.nan_to_num(score_v_ds, nan=0.0, posinf=10.0, neginf=-10.0)
-
-                use_sparse_evidence_attn = True
-
-        if use_sparse_evidence_attn:
-            xa_sel, xa_sel_valid, xa_sel_idx = self._select_topk_tokens(
-                xa_ds,
-                score_a_ds,
-                valid_mask_ds,
-                topk_ratio=self.attn_topk_ratio_a,
-                min_tokens=self.attn_min_tokens_a,
-                max_tokens=self.attn_max_tokens_a,
-            )
-            xv_sel, xv_sel_valid, xv_sel_idx = self._select_topk_tokens(
-                xv_ds,
-                score_v_ds,
-                valid_mask_ds,
-                topk_ratio=self.attn_topk_ratio_v,
-                min_tokens=self.attn_min_tokens_v,
-                max_tokens=self.attn_max_tokens_v,
-            )
-
-            # ---- 2) 只在高证据 token 上做双向 cross-attention ----
-            xa_attn_sel = self.audio_from_video(
-                q=xa_sel,
-                kv=xv_sel,
-                key_padding_mask=~xv_sel_valid,   # True = ignore
-            )
-            xv_attn_sel = self.video_from_audio(
-                q=xv_sel,
-                kv=xa_sel,
-                key_padding_mask=~xa_sel_valid,
-            )
-
-            # 把 padded query 位置清零
-            xa_attn_sel = xa_attn_sel * xa_sel_valid.unsqueeze(-1).float()
-            xv_attn_sel = xv_attn_sel * xv_sel_valid.unsqueeze(-1).float()
-
-            # ---- 3) scatter 回原下采样时间轴 ----
-            xa_attn_ds = self._scatter_selected_tokens(
-                xa_ds, xa_attn_sel, xa_sel_idx, xa_sel_valid
-            )
-            xv_attn_ds = self._scatter_selected_tokens(
-                xv_ds, xv_attn_sel, xv_sel_idx, xv_sel_valid
-            )
-        else:
-            # 回退到你原来的 dense 双向 cross-attention
-            key_padding_mask_ds = ~valid_mask_ds  # True = ignore
+            key_padding_mask_ds = ~valid_mask_ds
 
             xa_attn_ds = self.audio_from_video(
                 q=xa_ds,
@@ -744,20 +1095,19 @@ class DepMamba(BaseNet):
                 key_padding_mask=key_padding_mask_ds,
             )
 
-        # ---- 4) 上采样回原始长度 ----
-        xa_attn = F.interpolate(
-            xa_attn_ds.permute(0, 2, 1),
-            size=xa.size(1),
-            mode="nearest",
-        ).permute(0, 2, 1)
+            xa_attn = F.interpolate(
+                xa_attn_ds.permute(0, 2, 1),
+                size=xa.size(1),
+                mode="nearest",
+            ).permute(0, 2, 1)
 
-        xv_attn = F.interpolate(
-            xv_attn_ds.permute(0, 2, 1),
-            size=xv.size(1),
-            mode="nearest",
-        ).permute(0, 2, 1)
+            xv_attn = F.interpolate(
+                xv_attn_ds.permute(0, 2, 1),
+                size=xv.size(1),
+                mode="nearest",
+            ).permute(0, 2, 1)
 
-        # ---- 5) 残差式增强 ----
+        # 6) 残差式增强
         xa_ctx = xa + self.cross_beta_a * xa_attn
         xv_ctx = xv + self.cross_beta_v * xv_attn
 
@@ -771,11 +1121,22 @@ class DepMamba(BaseNet):
         x_fused = torch.cat([xa_ctx, xv_ctx], dim=-1)  # (B, T, 2D)
         x_fused = self.fusion_encoder(x_fused, inference_params=None)
 
-        # 7) pooling
+        # 7) final pooling
         if padding_mask is not None:
-            feat = self._masked_mean_pool(x_fused, padding_mask)
+            global_feat = self._masked_mean_pool(x_fused, padding_mask)
         else:
-            feat = self.pool(x_fused.permute(0, 2, 1)).squeeze(-1)
+            global_feat = self.pool(x_fused.permute(0, 2, 1)).squeeze(-1)
+
+        if self.final_pooling == "mean_plus_proposal":
+            proposal_feat, proposal_time_mask = self._proposal_guided_pooling(
+                x_fused,
+                aux_a=aux_a,
+                aux_v=aux_v,
+                padding_mask=padding_mask,
+            )
+            feat = torch.cat([global_feat, proposal_feat], dim=-1)
+        else:
+            feat = global_feat
 
         if return_intermediate:
             return {
@@ -788,6 +1149,8 @@ class DepMamba(BaseNet):
                 "video_gate": gate_v,
                 "audio_logits": logits_a,
                 "video_logits": logits_v,
+                "audio_aux": aux_a,
+                "video_aux": aux_v,
             }
         else:
             return feat

@@ -214,6 +214,40 @@ def masked_topk_mean(score_map, valid_mask=None, topk_ratio=0.1):
 
     return torch.stack(bag_scores, dim=0).unsqueeze(1)  # (B,1)
 
+def masked_topk_mean_vec(score_vec, valid_mask=None, topk_ratio=0.1):
+    """
+    score_vec: (B, N)
+    valid_mask: (B, N), 1/True = valid
+    return: (B, 1)
+    """
+    B, N = score_vec.shape
+    bag_scores = []
+
+    for i in range(B):
+        if valid_mask is None:
+            cur = score_vec[i]
+        else:
+            cur = score_vec[i][valid_mask[i].bool()]
+
+        if cur.numel() == 0:
+            bag_scores.append(torch.zeros((), device=score_vec.device, dtype=score_vec.dtype))
+            continue
+
+        k = max(1, int(math.ceil(cur.numel() * topk_ratio)))
+        topk_vals = torch.topk(cur, k=k, dim=-1).values
+        bag_scores.append(topk_vals.mean())
+
+    return torch.stack(bag_scores, dim=0).unsqueeze(1)  # (B,1)
+
+
+def proposal_topk_mil_loss(proposal_scores, labels, proposal_valid_mask=None, topk_ratio=0.1):
+    """
+    proposal_scores: (B, N)
+    proposal_valid_mask: (B, N)
+    """
+    bag_logits = masked_topk_mean_vec(proposal_scores, proposal_valid_mask, topk_ratio)
+    return F.binary_cross_entropy_with_logits(bag_logits, labels.float())
+
 
 def topk_mil_loss(score_map, labels, valid_mask=None, topk_ratio=0.1):
     """
@@ -266,6 +300,8 @@ def train_epoch(
     loss_s_sum = 0.0
     loss_c_sum = 0.0
     loss_mil_sum = 0.0
+    loss_mil_point_sum = 0.0
+    loss_mil_prop_sum = 0.0
     loss_comp_sum = 0.0
 
     with tqdm(
@@ -346,39 +382,80 @@ def train_epoch(
             mil_topk_ratio = getattr(core_net, "mil_topk_ratio", 0.1)
             comp_topk_ratio = getattr(core_net, "comp_topk_ratio", 0.1)
 
+            proposal_mil_weight = getattr(core_net, "proposal_mil_weight", 0.0)
+            proposal_mil_topk_ratio = getattr(core_net, "proposal_mil_topk_ratio", mil_topk_ratio)
+
             loss_cls = loss_fn(s_logits, y.to(torch.float32))
             loss_s_term = lambda_sparse * loss_sparsity
             loss_c_term = lambda_cont * loss_continuity
 
-            # ===== proposal-aware ASG v2: top-k MIL + completeness aux =====
-            loss_mil = torch.tensor(0.0, device=device)
+            # ===== point-wise + proposal-wise MIL + completeness aux =====
+            loss_mil_point = torch.tensor(0.0, device=device)
+            loss_mil_prop = torch.tensor(0.0, device=device)
             loss_comp_aux = torch.tensor(0.0, device=device)
+
             num_aux_terms = 0
+            num_prop_terms = 0
 
             if aux_a is not None and "final_score" in aux_a:
-                loss_mil = loss_mil + topk_mil_loss(
+                # point-wise MIL
+                loss_mil_point = loss_mil_point + topk_mil_loss(
                     aux_a["final_score"], y, mask, topk_ratio=mil_topk_ratio
                 )
+
+                # completeness aux 仍先保留点级版本
                 loss_comp_aux = loss_comp_aux + completeness_aux_loss(
                     aux_a["raw_score"], aux_a["comp_score"], y, mask, topk_ratio=comp_topk_ratio
                 )
                 num_aux_terms += 1
 
+                # proposal-wise MIL（如果 proposal 已生成）
+                prop_scores_a = aux_a.get("proposal_scores", None)
+                prop_valid_a = aux_a.get("proposal_valid_mask", None)
+                if prop_scores_a is not None and prop_valid_a is not None:
+                    loss_mil_prop = loss_mil_prop + proposal_topk_mil_loss(
+                        prop_scores_a, y, prop_valid_a, topk_ratio=proposal_mil_topk_ratio
+                    )
+                    num_prop_terms += 1
+
             if aux_v is not None and "final_score" in aux_v:
-                loss_mil = loss_mil + topk_mil_loss(
+                # point-wise MIL
+                loss_mil_point = loss_mil_point + topk_mil_loss(
                     aux_v["final_score"], y, mask, topk_ratio=mil_topk_ratio
                 )
+
+                # completeness aux
                 loss_comp_aux = loss_comp_aux + completeness_aux_loss(
                     aux_v["raw_score"], aux_v["comp_score"], y, mask, topk_ratio=comp_topk_ratio
                 )
                 num_aux_terms += 1
 
+                # proposal-wise MIL
+                prop_scores_v = aux_v.get("proposal_scores", None)
+                prop_valid_v = aux_v.get("proposal_valid_mask", None)
+                if prop_scores_v is not None and prop_valid_v is not None:
+                    loss_mil_prop = loss_mil_prop + proposal_topk_mil_loss(
+                        prop_scores_v, y, prop_valid_v, topk_ratio=proposal_mil_topk_ratio
+                    )
+                    num_prop_terms += 1
+
             if num_aux_terms > 0:
-                loss_mil = loss_mil / num_aux_terms
+                loss_mil_point = loss_mil_point / num_aux_terms
                 loss_comp_aux = loss_comp_aux / num_aux_terms
             else:
-                loss_mil = torch.tensor(0.0, device=device)
+                loss_mil_point = torch.tensor(0.0, device=device)
                 loss_comp_aux = torch.tensor(0.0, device=device)
+
+            if num_prop_terms > 0:
+                loss_mil_prop = loss_mil_prop / num_prop_terms
+            else:
+                loss_mil_prop = torch.tensor(0.0, device=device)
+
+            # 默认 proposal_mil_weight=0.0，当前行为保持和以前一致
+            if proposal_mil_weight > 0.0 and num_prop_terms > 0:
+                loss_mil = (1.0 - proposal_mil_weight) * loss_mil_point + proposal_mil_weight * loss_mil_prop
+            else:
+                loss_mil = loss_mil_point
 
             loss_mil_term = lambda_mil * loss_mil
             loss_comp_term = lambda_comp_aux * loss_comp_aux
@@ -416,6 +493,8 @@ def train_epoch(
             loss_s_sum += loss_s_term.item() * bsz
             loss_c_sum += loss_c_term.item() * bsz
             loss_mil_sum += loss_mil_term.item() * bsz
+            loss_mil_point_sum += loss_mil_point.item() * bsz
+            loss_mil_prop_sum += loss_mil_prop.item() * bsz
             loss_comp_sum += loss_comp_term.item() * bsz
 
             sample_count += bsz
@@ -446,6 +525,8 @@ def train_epoch(
     loss_s_avg = loss_s_sum / sample_count if sample_count > 0 else 0.0
     loss_c_avg = loss_c_sum / sample_count if sample_count > 0 else 0.0
     loss_mil_avg = loss_mil_sum / sample_count if sample_count > 0 else 0.0
+    loss_mil_point_avg = loss_mil_point_sum / sample_count if sample_count > 0 else 0.0
+    loss_mil_prop_avg = loss_mil_prop_sum / sample_count if sample_count > 0 else 0.0
     loss_comp_avg = loss_comp_sum / sample_count if sample_count > 0 else 0.0
 
     return {
@@ -458,6 +539,8 @@ def train_epoch(
         "loss_s": loss_s_avg,
         "loss_c": loss_c_avg,
         "loss_mil": loss_mil_avg,
+        "loss_mil_point": loss_mil_point_avg,
+        "loss_mil_prop": loss_mil_prop_avg,
         "loss_comp_aux": loss_comp_avg,
     }
 
@@ -607,6 +690,8 @@ def main():
         mil_topk_ratio = float(train_cfg.get("mil_topk_ratio", 0.10))
         comp_topk_ratio = float(train_cfg.get("comp_topk_ratio", 0.10))
         early_stop_patience = int(train_cfg.get("early_stop_patience", 999999))
+        proposal_mil_weight = float(train_cfg.get("proposal_mil_weight", 0.0))
+        proposal_mil_topk_ratio = float(train_cfg.get("proposal_mil_topk_ratio", mil_topk_ratio))
 
         net = net.to(args.device[0])
         if len(args.device) > 1:
@@ -619,6 +704,9 @@ def main():
         core_net.lambda_comp_peak = lambda_comp_peak
         core_net.mil_topk_ratio = mil_topk_ratio
         core_net.comp_topk_ratio = comp_topk_ratio
+
+        core_net.proposal_mil_weight = proposal_mil_weight
+        core_net.proposal_mil_topk_ratio = proposal_mil_topk_ratio
 
         # ===== prepare data =====
         if args.dataset == "dvlog":
@@ -669,6 +757,7 @@ def main():
                     args.epochs,
                     args.tqdm_able,
                 )
+                #print(core_net.audio_selector.last_aux.keys())
                 val_results = val(net, val_loader, loss_fn, args.device[0], args.tqdm_able)
                 print(
                     f"[Epoch {epoch:03d}] "

@@ -32,6 +32,9 @@ dvlog_train:
   mil_topk_ratio: 0.10
   comp_topk_ratio: 0.10
 
+  proposal_mil_weight: 0.1
+  proposal_mil_topk_ratio: 0.1
+
 lmvd_train:
   epochs: 60
   learning_rate: 1e-5
@@ -80,6 +83,35 @@ mmmamba:
 
   cross_beta_a: 0.1
   cross_beta_v: 0.1
+
+  selector_enable_proposals: true
+  selector_build_proposals_in_train: true
+  selector_proposal_win_sizes: [8, 16, 32]
+  selector_proposal_stride_ratio: 0.5
+  selector_proposal_comp_weight: 0.3
+  selector_max_proposals: 12
+
+  proposal_attn_topk_ratio_a: 0.2
+  proposal_attn_topk_ratio_v: 0.2
+  proposal_attn_min_props_a: 2
+  proposal_attn_min_props_v: 2
+  proposal_attn_max_props_a: 6
+  proposal_attn_max_props_v: 6
+  proposal_pooling: "mean"
+
+  final_pooling: "mean_plus_proposal"
+  proposal_cls_topk_ratio_a: 0.2
+  proposal_cls_topk_ratio_v: 0.2
+  proposal_cls_min_props_a: 2
+  proposal_cls_min_props_v: 2
+  proposal_cls_max_props_a: 6
+  proposal_cls_max_props_v: 6
+
+  mamba_config:
+    d_state: 12
+    expand: 4
+    d_conv: 4
+    bidirectional: false
 
   mamba_config:
     d_state: 12
