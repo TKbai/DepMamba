@@ -3,12 +3,18 @@ train_gender: both
 test_gender: both
 
 model: DepMamba
-dataset: dvlog   # 默认值，可被 launch.json 覆盖
+dataset: dvlog
 train: true
 tqdm_able: true
+
+# 注意：batch_size 是全局共享的，当前 main.py 不会按数据集分别覆盖它
+batch_size: 8
 epochs: 120
-batch_size: 16
-learning_rate: 1e-5
+learning_rate: 0.00003
+
+# 你现在 launch.json 里已经传了 --gpu 0
+# 这里保留一个默认值，避免你以后直接终端运行时报错
+gpu: "0"
 
 if_wandb: false
 save_dir: "/home/ac/data/bai/DepMamba-main/savefile/"
@@ -19,20 +25,58 @@ device:
 # dataset-specific training cfg
 # ---------------------------
 dvlog_train:
-  epochs: 120
-  learning_rate: 1e-5
-  weight_decay: 0.0
-  early_stop_patience: 999
-  lambda_mil_peak: 0.10
-  lambda_comp_peak: 0.020
+  epochs: 60
+  learning_rate: 0.00005
+  weight_decay: 0.0001
+  aug: false
+
+  debug_overfit_small: false
+  overfit_pos: 8
+  overfit_neg: 8
+
+  lambda_struct_peak: 0.15
+  budget_rho: 0.26
+  comp_margin: 0.10
+  comp_topk_ratio: 0.10
+
+  lambda_neg: 1.30
+  lambda_budget: 0.7
+  lambda_tv: 0.20
+  lambda_comp: 0.15
 
 lmvd_train:
-  epochs: 60
-  learning_rate: 1e-5
-  weight_decay: 1.0e-4
-  early_stop_patience: 12
-  lambda_mil_peak: 0.04
-  lambda_comp_peak: 0.008
+  epochs: 80
+  learning_rate: 0.00002
+  weight_decay: 0.0001
+  aug: false
+
+  # Structural Evidence Shaping
+  lambda_struct_peak: 0.25
+  budget_rho: 0.25
+  comp_margin: 0.10
+  comp_topk_ratio: 0.10
+
+  lambda_neg: 1.0
+  lambda_budget: 1.0
+  lambda_tv: 0.15
+  lambda_comp: 0.30
+
+# 如果你当前不跑 SEARCH，这一段可以保留但不用管
+search_train:
+  epochs: 40
+  learning_rate: 0.0003
+  weight_decay: 0.001
+  aug: false
+
+  lambda_struct_peak: 0.0
+  budget_rho: 0.25
+  comp_margin: 0.10
+  comp_topk_ratio: 0.10
+
+  lambda_neg: 1.0
+  lambda_budget: 1.0
+  lambda_tv: 0.15
+  lambda_comp: 0.30
 
 # ---------------------------
 # D-Vlog model cfg
@@ -40,21 +84,35 @@ lmvd_train:
 mmmamba:
   audio_input_size: 25
   video_input_size: 136
-  mm_input_size: 256
-  mm_output_sizes: [256]
-  fusion_output_sizes: [128]
-  dropout: 0.1
-  d_ffn: 1024
-  num_layers: 1
-  selector_alpha: 0.7
-  activation: "GELU"
-  use_gate: true
+  mm_input_size: 128
+  uni_output_sizes: [256, 64]
+  dropout: 0.20
   causal: false
-  attn_heads: 1
+
+  discovery_hidden: 128
+  refine_hidden: 128
+  corroboration_hidden: 128
+
+  agg_beta: 0.30
+  use_corroboration: false
+
+  route_thresh: 0.55
+  route_topk: 2
+  min_span_len: 3
+
+  support_radius: 4
+  support_bias: 0.20
+  corro_shift: 0.40
+
+  span_lambda_max: 0.5
+  span_lambda_avg: 0.3
+  span_lambda_c: 0.2
+
+  contrast_windows: [3, 5]
 
   mamba_config:
     d_state: 12
-    expand: 4
+    expand: 2
     d_conv: 4
     bidirectional: false
 
@@ -64,20 +122,71 @@ mmmamba:
 mmmamba_lmvd:
   audio_input_size: 128
   video_input_size: 136
-  mm_input_size: 192
-  mm_output_sizes: [256]
-  fusion_output_sizes: [128]
-  dropout: 0.2
-  d_ffn: 1024
-  num_layers: 1
-  selector_alpha: 0.8
-  activation: "GELU"
-  use_gate: true
+  mm_input_size: 128
+  uni_output_sizes: [256, 64]
+  dropout: 0.20
   causal: false
-  attn_heads: 1
+
+  discovery_hidden: 128
+  refine_hidden: 128
+  corroboration_hidden: 128
+
+  agg_beta: 0.7
+
+  route_thresh: 0.50
+  route_topk: 3
+  min_span_len: 2
+
+  support_radius: 6
+  support_bias: 0.5
+  corro_shift: 1.0
+
+  span_lambda_max: 0.5
+  span_lambda_avg: 0.3
+  span_lambda_c: 0.2
+
+  contrast_windows: [3, 5]
 
   mamba_config:
     d_state: 16
+    expand: 2
+    d_conv: 4
+    bidirectional: false
+
+# ---------------------------
+# SEARCH model cfg
+# ---------------------------
+# 如果你现在不跑 SEARCH，这一段也可以先保留
+mmmamba_search:
+  audio_input_size: 128
+  video_input_size: 213
+  mm_input_size: 64
+  uni_output_sizes: [128, 64]
+  dropout: 0.5
+  causal: false
+
+  discovery_hidden: 64
+  refine_hidden: 64
+  corroboration_hidden: 64
+
+  agg_beta: 0.5
+
+  route_thresh: 0.50
+  route_topk: 2
+  min_span_len: 2
+
+  support_radius: 4
+  support_bias: 0.5
+  corro_shift: 0.8
+
+  span_lambda_max: 0.5
+  span_lambda_avg: 0.3
+  span_lambda_c: 0.2
+
+  contrast_windows: [3, 5]
+
+  mamba_config:
+    d_state: 8
     expand: 2
     d_conv: 4
     bidirectional: false

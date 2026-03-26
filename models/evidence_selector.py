@@ -4,52 +4,53 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class EvidenceSelector(nn.Module):
+class EvidenceDiscoveryHead(nn.Module):
     """
-    Proposal-aware ASG v2 (lightweight)
     输入:
-        x: (B, D, L)
+        x: (B, D, T)
     输出:
-        gate:   (B, 1, L)
-        logits: (B, 2, L)   # 兼容原接口：drop / keep
-    额外:
-        self.last_aux: 保存 raw score / completeness / final score，供 loss 使用
+        proposal_score: (B, T)
+        aux: {"proposal_logit": (B, T)}
+
+    改动点：
+    1) 输入 LayerNorm
+    2) score logit 做 masked centering
+    3) 负 bias 初始化，鼓励 sparse proposal
+    4) temperature + clamp，避免 sigmoid 饱和
     """
     def __init__(
         self,
         d_in,
         d_hidden=128,
-        tau=1.0,
-        hard=False,
-        use_gumbel=False,
-        win_sizes=(7, 15, 31),
-        comp_weight=0.3,
+        dropout=0.1,
+        score_temp=2.5,
+        logit_clip=8.0,
+        init_bias=-2.0,
     ):
         super().__init__()
 
-        self.tau = tau
-        self.hard = hard
-        self.use_gumbel = use_gumbel
-        self.win_sizes = win_sizes
-        self.comp_weight = comp_weight
+        self.in_norm = nn.LayerNorm(d_in)
 
-        # -------- 多尺度时序建模 --------
         self.branch3 = nn.Conv1d(d_in, d_hidden // 3, kernel_size=3, padding=1)
         self.branch7 = nn.Conv1d(d_in, d_hidden // 3, kernel_size=7, padding=3)
-        self.branch15 = nn.Conv1d(d_in, d_hidden - 2 * (d_hidden // 3), kernel_size=15, padding=7)
+        self.branch15 = nn.Conv1d(
+            d_in,
+            d_hidden - 2 * (d_hidden // 3),
+            kernel_size=15,
+            padding=7,
+        )
 
         self.fuse = nn.Sequential(
             nn.Conv1d(d_hidden, d_hidden, kernel_size=1),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
 
-        # raw evidence score
-        self.score_head = nn.Conv1d(d_hidden, 1, kernel_size=1)
+        self.score_head = nn.Conv1d(d_hidden, 1, kernel_size=1, bias=True)
 
-        # keep/drop logits head（兼容旧接口）
-        self.logit_head = nn.Conv1d(1, 2, kernel_size=1)
-
-        self.last_aux = {}
+        self.score_temp = score_temp
+        self.logit_clip = logit_clip
+        self.init_bias = init_bias
 
         self._init_weights()
 
@@ -60,93 +61,50 @@ class EvidenceSelector(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+        # 很关键：给 proposal 一个“默认偏低”的先验
+        if self.score_head.bias is not None:
+            nn.init.constant_(self.score_head.bias, self.init_bias)
+
     @staticmethod
-    def _same_avg_pool(x, k):
-        # x: (B,1,L)
-        pad = k // 2
-        return F.avg_pool1d(F.pad(x, (pad, pad), mode="replicate"), kernel_size=k, stride=1)
+    def _masked_center(logit, padding_mask=None):
+        # logit: (B, T)
+        if padding_mask is None:
+            return logit - logit.mean(dim=-1, keepdim=True)
 
-    def _completeness_score(self, raw_score):
-        """
-        raw_score: (B,1,L)
-        轻量 completeness:
-        内部窗口均值 - 左右更大上下文均值
-        """
-        comp_all = []
-        for k in self.win_sizes:
-            inside = self._same_avg_pool(raw_score, k)
+        m = padding_mask.float()
+        mean = (logit * m).sum(dim=-1, keepdim=True) / m.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        centered = (logit - mean) * m
+        return centered
 
-            outer_k = min(2 * k + 1, raw_score.size(-1) if raw_score.size(-1) % 2 == 1 else raw_score.size(-1) - 1)
-            outer_k = max(outer_k, k + 2 if (k + 2) % 2 == 1 else k + 3)
-            outer = self._same_avg_pool(raw_score, outer_k)
+    def forward(self, x, padding_mask=None):
+        # x: (B, D, T)
+        x = self.in_norm(x.transpose(1, 2)).transpose(1, 2)
 
-            comp = inside - outer
-            comp_all.append(comp)
-
-        comp_score = torch.stack(comp_all, dim=0).mean(dim=0)  # (B,1,L)
-        return comp_score
-
-    def forward(self, x):
-        # x: (B, D, L)
         h3 = self.branch3(x)
         h7 = self.branch7(x)
         h15 = self.branch15(x)
 
-        h = torch.cat([h3, h7, h15], dim=1)      # (B, d_hidden, L)
+        h = torch.cat([h3, h7, h15], dim=1)
         h = self.fuse(h)
 
-        raw_score = self.score_head(h)           # (B,1,L)
-        raw_score = torch.clamp(raw_score, min=-10.0, max=10.0)
+        raw_logit = self.score_head(h).squeeze(1)   # (B, T)
 
-        comp_score = self._completeness_score(raw_score)   # (B,1,L)
-        comp_score = torch.clamp(comp_score, min=-10.0, max=10.0)
+        # 先做 sample 内部的相对中心化，避免整段一起变大
+        proposal_logit = self._masked_center(raw_logit, padding_mask)
 
-        final_score = raw_score + self.comp_weight * comp_score
-        final_score = torch.clamp(final_score, min=-10.0, max=10.0)
+        # 再做温度缩放 + clip，防止进入 sigmoid 饱和区
+        proposal_logit = proposal_logit / self.score_temp
+        proposal_logit = proposal_logit.clamp(min=-self.logit_clip, max=self.logit_clip)
 
-        # 兼容原接口：生成 2 类 logits
-        logits = self.logit_head(final_score)    # (B,2,L)
-        logits = torch.clamp(logits, min=-10.0, max=10.0)
+        if padding_mask is not None:
+            proposal_logit = proposal_logit.masked_fill(padding_mask == 0, -1e4)
 
-        logits_t = logits.permute(0, 2, 1)       # (B,L,2)
+        proposal_score = torch.sigmoid(proposal_logit)
+        if padding_mask is not None:
+            proposal_score = proposal_score * padding_mask.float()
 
-        if self.use_gumbel:
-            probs = F.gumbel_softmax(
-                logits_t, tau=self.tau, hard=self.hard, dim=-1
-            )
-        else:
-            probs = F.softmax(logits_t, dim=-1)
-
-        gate = probs[..., 1].unsqueeze(1)        # (B,1,L)
-
-        # 保存辅助量，供 main.py 做 top-k MIL / completeness loss
-        self.last_aux = {
-            "raw_score": raw_score,      # (B,1,L)
-            "comp_score": comp_score,    # (B,1,L)
-            "final_score": final_score,  # (B,1,L)
+        aux = {
+            "proposal_logit": proposal_logit,
+            "raw_logit": raw_logit,
         }
-
-        return gate, logits
-
-
-class VideoSelector(nn.Module):
-    # 保留占位，当前主路径不用
-    def __init__(self, d_in: int, d_hidden: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(d_in, d_hidden, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(d_hidden, 1, kernel_size=3, padding=1),
-        )
-
-        for m in self.net:
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, x: torch.Tensor):
-        logits = self.net(x)
-        logits = torch.clamp(logits, min=-10.0, max=10.0)
-        gate = torch.sigmoid(logits)
-        return gate, logits
+        return proposal_score, aux

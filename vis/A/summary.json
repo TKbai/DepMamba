@@ -1,0 +1,38 @@
+[
+  {
+    "index": 0,
+    "kind": "FN",
+    "y_true": 1,
+    "pred": 0,
+    "prob": 0.010389633476734161,
+    "png": "./vis/A/idx_0000_FN.png",
+    "npz": "./vis/A/idx_0000_FN.npz"
+  },
+  {
+    "index": 5,
+    "kind": "TP",
+    "y_true": 1,
+    "pred": 1,
+    "prob": 0.5713445544242859,
+    "png": "./vis/A/idx_0005_TP.png",
+    "npz": "./vis/A/idx_0005_TP.npz"
+  },
+  {
+    "index": 57,
+    "kind": "FP",
+    "y_true": 0,
+    "pred": 1,
+    "prob": 0.7887459993362427,
+    "png": "./vis/A/idx_0057_FP.png",
+    "npz": "./vis/A/idx_0057_FP.npz"
+  },
+  {
+    "index": 58,
+    "kind": "TN",
+    "y_true": 0,
+    "pred": 0,
+    "prob": 0.14172108471393585,
+    "png": "./vis/A/idx_0058_TN.png",
+    "npz": "./vis/A/idx_0058_TN.npz"
+  }
+]

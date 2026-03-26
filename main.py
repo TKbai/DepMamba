@@ -1,31 +1,38 @@
-import argparse
-import os
-import yaml
-import json
-import inspect
-import random
-import math
 
-import wandb
+import argparse
+import inspect
+import json
+import math
+import os
+import random
+from typing import Dict, Optional
+from torch.utils.data import DataLoader, Subset
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
+import wandb
+import yaml
 from tqdm import tqdm
 
 from models import DepMamba
-from datasets import get_dvlog_dataloader, get_lmvd_dataloader
-
+from datasets import (
+    get_dvlog_dataloader,
+    get_lmvd_dataloader,
+    get_search_dataloader,
+)
 
 CONFIG_PATH = "./config/config.yaml"
 
 
-def setup_seed(seed):
+def setup_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -36,11 +43,12 @@ def str2bool(v):
         return False
     raise argparse.ArgumentTypeError("Boolean value expected.")
 
+
 def parse_args():
     with open(CONFIG_PATH, "r") as f:
         config = yaml.safe_load(f)
 
-    parser = argparse.ArgumentParser(description="Train and test a model.")
+    parser = argparse.ArgumentParser(description="Train and test DepMamba.")
     parser.add_argument("--data_dir", type=str)
     parser.add_argument("--train_gender", type=str)
     parser.add_argument("--test_gender", type=str)
@@ -67,131 +75,249 @@ def get_core_model(net):
 
 def sanitize_depmamba_cfg(cfg: dict):
     """
-    兼容旧 config 和新 DepMamba.__init__ 的字段。
-    如果新模型没有某些旧字段，就自动忽略。
+    Keep backward compatibility with older configs.
     """
     cfg = dict(cfg)
 
-    # 兼容旧字段名
     if "mm_output_sizes" in cfg and "uni_output_sizes" not in cfg:
         cfg["uni_output_sizes"] = cfg["mm_output_sizes"]
 
-    # 如果你想让 fusion_output_sizes 也可由 config 控制，这里优先保留 config 原值
-    if "fusion_output_sizes" not in cfg:
-        cfg["fusion_output_sizes"] = [128]
+    if "fusion_output_sizes" in cfg and "uni_output_sizes" not in cfg:
+        pass
 
-    # 默认打开 gate
-    if "use_gate" not in cfg:
-        cfg["use_gate"] = False
-
-    # selector / attention 默认值
-    cfg.setdefault("selector_tau", 1.0)
-    cfg.setdefault("selector_hard", False)
-    cfg.setdefault("selector_alpha", 0.5)
-    cfg.setdefault("attn_heads", 1)
-
-    # 过滤掉新 DepMamba 不接受的参数
     valid_params = set(inspect.signature(DepMamba.__init__).parameters.keys())
     valid_params.discard("self")
     cfg = {k: v for k, v in cfg.items() if k in valid_params}
-
     return cfg
+
 
 def get_dataset_train_cfg(args):
     if args.dataset == "lmvd":
         return getattr(args, "lmvd_train", {})
     elif args.dataset == "dvlog":
         return getattr(args, "dvlog_train", {})
+    elif args.dataset == "search":
+        return getattr(args, "search_train", {})
+    return {}
+
+
+def get_model_cfg(args):
+    if args.dataset == "lmvd":
+        return dict(args.mmmamba_lmvd)
+    elif args.dataset == "dvlog":
+        return dict(args.mmmamba)
+    elif args.dataset == "search":
+        return dict(args.mmmamba_search)
+    raise ValueError(f"Unknown dataset {args.dataset}")
+
+
+def build_dataloaders(args):
+    train_cfg = get_dataset_train_cfg(args)
+    aug = bool(train_cfg.get("aug", False))
+
+    if args.dataset == "dvlog":
+        train_loader = get_dvlog_dataloader(
+            args.data_dir, "train", args.batch_size, args.train_gender, aug=aug
+        )
+        val_loader = get_dvlog_dataloader(
+            args.data_dir, "valid", args.batch_size, args.test_gender, aug=False
+        )
+        test_loader = get_dvlog_dataloader(
+            args.data_dir, "test", args.batch_size, args.test_gender, aug=False
+        )
+    elif args.dataset == "lmvd":
+        train_loader = get_lmvd_dataloader(
+            args.data_dir, "train", args.batch_size, args.train_gender, aug=aug
+        )
+        val_loader = get_lmvd_dataloader(
+            args.data_dir, "valid", args.batch_size, args.test_gender, aug=False
+        )
+        test_loader = get_lmvd_dataloader(
+            args.data_dir, "test", args.batch_size, args.test_gender, aug=False
+        )
+    elif args.dataset == "search":
+        train_loader = get_search_dataloader(
+            args.data_dir, "train", args.batch_size, args.train_gender
+        )
+        val_loader = get_search_dataloader(
+            args.data_dir, "valid", args.batch_size, args.test_gender
+        )
+        test_loader = get_search_dataloader(
+            args.data_dir, "test", args.batch_size, args.test_gender
+        )
     else:
-        return {}
+        raise ValueError(f"Unknown dataset {args.dataset}")
+
+    return train_loader, val_loader, test_loader
 
 
-def get_lambda_sparse(epoch: int) -> float:
-    if epoch < 30:
-        return 0.0
-    elif epoch < 90:
-        return 0.05 * (epoch - 30) / 60.0
-    else:
-        return 0.05
+def masked_mean_1d(x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    if mask is None:
+        return x.mean(dim=-1)
+    m = mask.float()
+    return (x * m).sum(dim=-1) / m.sum(dim=-1).clamp(min=1.0)
 
 
-def get_lambda_cont(epoch: int) -> float:
-    if epoch < 30:
-        return 0.0
-    else:
-        return 0.005
-
-def get_lambda_mil(epoch: int, total_epochs: int, peak: float) -> float:
-    # 前期 warm-up，中期保持，后期衰减
-    if epoch < 5:
-        return 0.0
-    elif epoch < 20:
-        return peak * (epoch - 5) / 15.0
-    elif epoch < int(0.65 * total_epochs):
-        return peak
-    else:
-        decay_len = total_epochs - int(0.65 * total_epochs)
-        remain = total_epochs - epoch
-        return peak * max(0.0, remain / max(1, decay_len))
+def masked_tv_1d(x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    diff = torch.abs(x[:, 1:] - x[:, :-1])
+    if mask is None:
+        return diff.mean(dim=-1)
+    edge_mask = (mask[:, 1:] * mask[:, :-1]).float()
+    return (diff * edge_mask).sum(dim=-1) / edge_mask.sum(dim=-1).clamp(min=1.0)
 
 
-def get_lambda_comp_aux(epoch: int, total_epochs: int, peak: float) -> float:
-    if epoch < 5:
-        return 0.0
-    elif epoch < 20:
-        return peak * (epoch - 5) / 15.0
-    elif epoch < int(0.65 * total_epochs):
-        return peak
-    else:
-        decay_len = total_epochs - int(0.65 * total_epochs)
-        remain = total_epochs - epoch
-        return peak * max(0.0, remain / max(1, decay_len))
-
-
-def masked_topk_mean(score_map, valid_mask=None, topk_ratio=0.1):
+def masked_topk_comp_loss(
+    score: torch.Tensor,
+    contrast: torch.Tensor,
+    labels: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    margin: float = 0.15,
+    topk_ratio: float = 0.1,
+):
     """
-    score_map: (B,1,L)
-    valid_mask: (B,L), 1=valid
-    return: (B,1)
+    score, contrast: (B, T)
+    labels: (B, 1)
     """
-    s = score_map.squeeze(1)   # (B,L)
-    B, L = s.shape
-    bag_scores = []
+    B = score.size(0)
+    pos_mask = labels.squeeze(1) > 0.5
+    losses = []
 
-    for i in range(B):
-        if valid_mask is None:
-            cur = s[i]
-        else:
-            cur = s[i][valid_mask[i].bool()]
-
-        if cur.numel() == 0:
-            bag_scores.append(torch.zeros((), device=s.device, dtype=s.dtype))
+    for b in range(B):
+        if not bool(pos_mask[b].item()):
             continue
 
-        k = max(1, int(math.ceil(cur.numel() * topk_ratio)))
-        topk_vals = torch.topk(cur, k=k, dim=-1).values
-        bag_scores.append(topk_vals.mean())
+        if mask is None:
+            cur_s = score[b]
+            cur_c = contrast[b]
+        else:
+            valid = mask[b].bool()
+            cur_s = score[b][valid]
+            cur_c = contrast[b][valid]
 
-    return torch.stack(bag_scores, dim=0).unsqueeze(1)  # (B,1)
+        if cur_s.numel() == 0:
+            continue
+
+        k = max(1, int(math.ceil(cur_s.numel() * topk_ratio)))
+        idx = torch.topk(cur_s, k=k, dim=-1).indices
+        cur_loss = F.relu(margin - cur_c[idx]).mean()
+        losses.append(cur_loss)
+
+    if len(losses) == 0:
+        return torch.tensor(0.0, device=score.device, dtype=score.dtype)
+    return torch.stack(losses).mean()
 
 
-def topk_mil_loss(score_map, labels, valid_mask=None, topk_ratio=0.1):
-    """
-    用 evidence score 的 top-k 聚合做 bag-level BCE
-    """
-    bag_logits = masked_topk_mean(score_map, valid_mask, topk_ratio)
-    return F.binary_cross_entropy_with_logits(bag_logits, labels.float())
+def compute_structural_loss(
+    refined_score: torch.Tensor,   # (B, T)
+    contrast: torch.Tensor,        # (B, T)
+    labels: torch.Tensor,          # (B, 1)
+    mask: Optional[torch.Tensor],
+    cfg: Dict,
+):
+    mean_score = masked_mean_1d(refined_score, mask)
+    tv_per_sample = masked_tv_1d(refined_score, mask)
+
+    pos_mask = (labels.squeeze(1) > 0.5).float()
+    neg_mask = 1.0 - pos_mask
+
+    loss_neg = (mean_score * neg_mask).sum() / neg_mask.sum().clamp(min=1.0)
+    loss_budget = ((F.relu(mean_score - cfg["budget_rho"]) ** 2) * pos_mask).sum() / pos_mask.sum().clamp(min=1.0)
+    loss_tv = tv_per_sample.mean()
+    loss_comp = masked_topk_comp_loss(
+        refined_score,
+        contrast,
+        labels,
+        mask=mask,
+        margin=cfg["comp_margin"],
+        topk_ratio=cfg["comp_topk_ratio"],
+    )
+
+    total = (
+        cfg["lambda_neg"] * loss_neg
+        + cfg["lambda_budget"] * loss_budget
+        + cfg["lambda_tv"] * loss_tv
+        + cfg["lambda_comp"] * loss_comp
+    )
+
+    return total, {
+        "neg": float(loss_neg.detach().item()),
+        "budget": float(loss_budget.detach().item()),
+        "tv": float(loss_tv.detach().item()),
+        "comp": float(loss_comp.detach().item()),
+    }
 
 
-def completeness_aux_loss(raw_score, comp_score, labels, valid_mask=None, topk_ratio=0.1):
-    """
-    轻量 completeness:
-    只在高 evidence 区域强调 completeness
-    """
-    # 用 raw evidence 的 sigmoid 作为权重，detach 避免互相拖拽太厉害
-    weighted_comp = comp_score * torch.sigmoid(raw_score.detach())
-    bag_logits = masked_topk_mean(weighted_comp, valid_mask, topk_ratio)
-    return F.binary_cross_entropy_with_logits(bag_logits, labels.float())
+def summarize_binary_counts(TP: int, FP: int, TN: int, FN: int):
+    total = TP + FP + TN + FN
+    acc = (TP + TN) / total if total > 0 else 0.0
+    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+    recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+    specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+    f1 = 2.0 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    balanced_acc = 0.5 * (recall + specificity)
+    pred_pos_rate = (TP + FP) / total if total > 0 else 0.0
+    return {
+        "acc": acc,
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "f1": f1,
+        "balanced_acc": balanced_acc,
+        "pred_pos_rate": pred_pos_rate,
+        "TP": TP,
+        "FP": FP,
+        "TN": TN,
+        "FN": FN,
+    }
+
+
+def evaluate_constant_baseline(data_loader, predict_positive: bool = True):
+    TP, FP, TN, FN = 0, 0, 0, 0
+    constant = 1 if predict_positive else 0
+    with torch.no_grad():
+        for _, y, _ in data_loader:
+            y = y.view(-1).int()
+            pred = torch.full_like(y, fill_value=constant)
+            TP += torch.sum((pred == 1) & (y == 1)).item()
+            FP += torch.sum((pred == 1) & (y == 0)).item()
+            TN += torch.sum((pred == 0) & (y == 0)).item()
+            FN += torch.sum((pred == 0) & (y == 1)).item()
+    stats = summarize_binary_counts(TP, FP, TN, FN)
+    stats["name"] = "all_positive" if predict_positive else "all_negative"
+    return stats
+
+
+def make_balanced_subset_loader(loader, pos_count: int = 8, neg_count: int = 8, shuffle: bool = True):
+    dataset = loader.dataset
+    if hasattr(dataset, "labels"):
+        labels = [int(v) for v in dataset.labels]
+    else:
+        labels = [int(dataset[i][1]) for i in range(len(dataset))]
+
+    pos_idx = [i for i, y in enumerate(labels) if y == 1][:pos_count]
+    neg_idx = [i for i, y in enumerate(labels) if y == 0][:neg_count]
+    indices = pos_idx + neg_idx
+    if len(indices) == 0:
+        raise RuntimeError("Balanced subset is empty.")
+
+    subset = Subset(dataset, indices)
+    bs = min(loader.batch_size or len(indices), len(indices))
+
+    return DataLoader(
+        subset,
+        batch_size=bs,
+        shuffle=shuffle,
+        collate_fn=loader.collate_fn,
+        num_workers=0,
+        drop_last=False,
+    )
+
+
+def get_lambda_struct(epoch: int, total_epochs: int, peak: float):
+    warmup_epochs = min(10, max(3, total_epochs // 12))
+    if epoch < warmup_epochs:
+        return peak * float(epoch + 1) / float(warmup_epochs)
+    return peak
 
 
 def train_epoch(
@@ -203,28 +329,29 @@ def train_epoch(
     current_epoch,
     total_epochs,
     tqdm_able,
+    struct_cfg: Dict,
 ):
     net.train()
-    core_net = get_core_model(net)
-
-    # 新版本 selector 默认走确定性 soft gate
-    if hasattr(core_net, "audio_selector") and hasattr(core_net.audio_selector, "use_gumbel"):
-        core_net.audio_selector.use_gumbel = False
-    if hasattr(core_net, "video_selector") and hasattr(core_net.video_selector, "use_gumbel"):
-        core_net.video_selector.use_gumbel = False
 
     sample_count = 0
     running_loss = 0.0
-    correct_count = 0
+    running_cls = 0.0
+    running_struct = 0.0
+    running_neg = 0.0
+    running_budget = 0.0
+    running_tv = 0.0
+    running_comp = 0.0
 
-    gate_a_sum = 0.0
-    gate_a_keep_sum = 0.0
-    gate_v_sum = 0.0
-    gate_v_keep_sum = 0.0
-    gate_count = 0
+    TP, FP, TN, FN = 0, 0, 0, 0
+    logit_sum = 0.0
+    logit_sq_sum = 0.0
+    prob_sum = 0.0
 
-    loss_s_sum = 0.0
-    loss_c_sum = 0.0
+    lambda_struct = get_lambda_struct(
+        current_epoch,
+        total_epochs,
+        peak=float(struct_cfg["lambda_struct_peak"]),
+    )
 
     with tqdm(
         train_loader,
@@ -235,252 +362,149 @@ def train_epoch(
     ) as pbar:
         for x, y, mask in pbar:
             x = x.to(device)
-            y = y.to(device).unsqueeze(1)
+            y = y.to(device).unsqueeze(1).float()
             mask = mask.to(device)
-            
 
             optimizer.zero_grad(set_to_none=True)
 
-            # 新版 DepMamba 仍支持 return_feat=True -> (logits, feat)
-            s_logits, s_feat = net(x, mask, return_feat=True)
+            info = net(x, padding_mask=mask, return_intermediate=True)
+            logits = info["logits"]
 
-            core_net = get_core_model(net)
-            gate_a = getattr(core_net, "last_audio_gate", None)  # (B,1,T) or None
-            gate_v = getattr(core_net, "last_video_gate", None)  # (B,1,T) or None
-            
-            aux_a = None
-            aux_v = None
+            loss_cls = loss_fn(logits, y)
 
-            if getattr(core_net, "audio_selector", None) is not None:
-                aux_a = getattr(core_net.audio_selector, "last_aux", None)
-
-            if getattr(core_net, "video_selector", None) is not None:
-                aux_v = getattr(core_net.video_selector, "last_aux", None)
-
-            # ====== 对称 gate 正则 ======
-            loss_sparsity = torch.tensor(0.0, device=device)
-            loss_continuity = torch.tensor(0.0, device=device)
-
-            num_gate_terms = 0
-
-            if gate_a is not None:
-                ga = gate_a
-                ga_det = ga.detach()
-
-
-
-                loss_sparsity = loss_sparsity + ga.mean()
-                loss_continuity = loss_continuity + torch.abs(ga[..., 1:] - ga[..., :-1]).mean()
-                num_gate_terms += 1
-
-            if gate_v is not None:
-                gv = gate_v
-                gv_det = gv.detach()
-
-
-
-                loss_sparsity = loss_sparsity + gv.mean()
-                loss_continuity = loss_continuity + torch.abs(gv[..., 1:] - gv[..., :-1]).mean()
-                num_gate_terms += 1
-
-            if num_gate_terms > 0:
-                loss_sparsity = loss_sparsity / num_gate_terms
-                loss_continuity = loss_continuity / num_gate_terms
-            else:
-                loss_sparsity = torch.tensor(0.0, device=device)
-                loss_continuity = torch.tensor(0.0, device=device)
-
-            lambda_sparse = get_lambda_sparse(current_epoch)
-            lambda_cont = get_lambda_cont(current_epoch)
-            lambda_mil = get_lambda_mil(
-                current_epoch,
-                total_epochs,
-                peak=getattr(core_net, "lambda_mil_peak", 0.1),
+            loss_struct_a, parts_a = compute_structural_loss(
+                refined_score=info["audio_refined"],
+                contrast=info["audio_contrast"],
+                labels=y,
+                mask=mask,
+                cfg=struct_cfg,
+            )
+            loss_struct_v, parts_v = compute_structural_loss(
+                refined_score=info["video_refined"],
+                contrast=info["video_contrast"],
+                labels=y,
+                mask=mask,
+                cfg=struct_cfg,
             )
 
-            lambda_comp_aux = get_lambda_comp_aux(
-                current_epoch,
-                total_epochs,
-                peak=getattr(core_net, "lambda_comp_peak", 0.02),
-            )
-
-            loss_cls = loss_fn(s_logits, y.to(torch.float32))
-            loss_s_term = lambda_sparse * loss_sparsity
-            loss_c_term = lambda_cont * loss_continuity
-
-            # ===== proposal-aware ASG v2: top-k MIL + completeness aux =====
-            loss_mil = torch.tensor(0.0, device=device)
-            loss_comp_aux = torch.tensor(0.0, device=device)
-            num_aux_terms = 0
-
-            if aux_a is not None and "final_score" in aux_a:
-                loss_mil = loss_mil + topk_mil_loss(
-                    aux_a["final_score"], y, mask, topk_ratio=0.1
-                )
-                loss_comp_aux = loss_comp_aux + completeness_aux_loss(
-                    aux_a["raw_score"], aux_a["comp_score"], y, mask, topk_ratio=0.1
-                )
-                num_aux_terms += 1
-
-            if aux_v is not None and "final_score" in aux_v:
-                loss_mil = loss_mil + topk_mil_loss(
-                    aux_v["final_score"], y, mask, topk_ratio=0.1
-                )
-                loss_comp_aux = loss_comp_aux + completeness_aux_loss(
-                    aux_v["raw_score"], aux_v["comp_score"], y, mask, topk_ratio=0.1
-                )
-                num_aux_terms += 1
-
-            if num_aux_terms > 0:
-                loss_mil = loss_mil / num_aux_terms
-                loss_comp_aux = loss_comp_aux / num_aux_terms
-            else:
-                loss_mil = torch.tensor(0.0, device=device)
-                loss_comp_aux = torch.tensor(0.0, device=device)
-
-            loss_mil_term = lambda_mil * loss_mil
-            loss_comp_term = lambda_comp_aux * loss_comp_aux
-
-            loss = loss_cls + loss_s_term + loss_c_term + loss_mil_term + loss_comp_term
-
-            if current_epoch % 2 == 0 and random.random() < 0.05:
-                print(
-                    f"[epoch {current_epoch}] "
-                    f"loss_cls={loss_cls.item():.3f}, "
-                    f"λ_s*Ls={loss_s_term.item():.3f}, "
-                    f"λ_c*Lc={loss_c_term.item():.3f}, "
-                    f"λ_mil*Lm={loss_mil_term.item():.3f}, "
-                    f"λ_comp*Lcomp={loss_comp_term.item():.3f}"
-                )
+            loss_struct = 0.5 * (loss_struct_a + loss_struct_v)
+            loss = loss_cls + lambda_struct * loss_struct
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             optimizer.step()
 
-            # ------- 统计 -------
             bsz = x.size(0)
-
-            if gate_a is not None:
-                ga_det = gate_a.detach()
-                gate_a_sum += ga_det.mean().item() * bsz
-                gate_a_keep_sum += (ga_det > 0.5).float().mean().item() * bsz
-                gate_count += bsz
-
-            if gate_v is not None:
-                gv_det = gate_v.detach()
-                gate_v_sum += gv_det.mean().item() * bsz
-                gate_v_keep_sum += (gv_det > 0.5).float().mean().item() * bsz
-
-            loss_s_sum += loss_s_term.item() * bsz
-            loss_c_sum += loss_c_term.item() * bsz
-
             sample_count += bsz
             running_loss += loss.item() * bsz
+            running_cls += loss_cls.item() * bsz
+            running_struct += (lambda_struct * loss_struct).item() * bsz
+            running_neg += 0.5 * (parts_a["neg"] + parts_v["neg"]) * bsz
+            running_budget += 0.5 * (parts_a["budget"] + parts_v["budget"]) * bsz
+            running_tv += 0.5 * (parts_a["tv"] + parts_v["tv"]) * bsz
+            running_comp += 0.5 * (parts_a["comp"] + parts_v["comp"]) * bsz
 
-            pred = (s_logits > 0.0).int()
-            correct_count += (pred == y).sum().item()
+            pred = (logits > 0.0).int()
+            y_int = y.int()
+            TP += torch.sum((pred == 1) & (y_int == 1)).item()
+            FP += torch.sum((pred == 1) & (y_int == 0)).item()
+            TN += torch.sum((pred == 0) & (y_int == 0)).item()
+            FN += torch.sum((pred == 0) & (y_int == 1)).item()
 
+            logit_sum += logits.detach().sum().item()
+            logit_sq_sum += (logits.detach() ** 2).sum().item()
+            prob_sum += torch.sigmoid(logits.detach()).sum().item()
+
+            live_stats = summarize_binary_counts(TP, FP, TN, FN)
             pbar.set_postfix(
                 {
                     "loss": running_loss / sample_count,
-                    "acc": correct_count / sample_count,
+                    "bal_acc": live_stats["balanced_acc"],
+                    "pred_pos": live_stats["pred_pos_rate"],
+                    "λ_struct": lambda_struct,
                 }
             )
 
-    epoch_loss = running_loss / sample_count
-    epoch_acc = correct_count / sample_count
-
-    if gate_count > 0:
-        gate_a_mean = gate_a_sum / gate_count
-        gate_a_keep = gate_a_keep_sum / gate_count
-        gate_v_mean = gate_v_sum / gate_count
-        gate_v_keep = gate_v_keep_sum / gate_count
-    else:
-        gate_a_mean = gate_a_keep = 0.0
-        gate_v_mean = gate_v_keep = 0.0
-
-    loss_s_avg = loss_s_sum / sample_count if sample_count > 0 else 0.0
-    loss_c_avg = loss_c_sum / sample_count if sample_count > 0 else 0.0
+    stats = summarize_binary_counts(TP, FP, TN, FN)
+    logit_mean = logit_sum / max(1, sample_count)
+    logit_var = max(0.0, logit_sq_sum / max(1, sample_count) - logit_mean ** 2)
 
     return {
-        "loss": epoch_loss,
-        "acc": epoch_acc,
-        "gate_a_mean": gate_a_mean,
-        "gate_a_keep": gate_a_keep,
-        "gate_v_mean": gate_v_mean,
-        "gate_v_keep": gate_v_keep,
-        "loss_s": loss_s_avg,
-        "loss_c": loss_c_avg,
-        "loss_mil": loss_mil_term.item() if sample_count > 0 else 0.0,
-        "loss_comp_aux": loss_comp_term.item() if sample_count > 0 else 0.0,
+        "loss": running_loss / sample_count,
+        "loss_cls": running_cls / sample_count,
+        "loss_struct": running_struct / sample_count,
+        "loss_neg": running_neg / sample_count,
+        "loss_budget": running_budget / sample_count,
+        "loss_tv": running_tv / sample_count,
+        "loss_comp": running_comp / sample_count,
+        "lambda_struct": lambda_struct,
+        "logit_mean": logit_mean,
+        "logit_std": math.sqrt(logit_var),
+        "prob_mean": prob_sum / max(1, sample_count),
+        **stats,
     }
 
 
-def val(net, val_loader, loss_fn, device, tqdm_able):
+def evaluate(net, data_loader, loss_fn, device, tqdm_able):
     net.eval()
     sample_count = 0
     running_loss = 0.0
     TP, FP, TN, FN = 0, 0, 0, 0
+    logit_sum = 0.0
+    logit_sq_sum = 0.0
+    prob_sum = 0.0
 
     with torch.no_grad():
         with tqdm(
-            val_loader,
-            desc="Validating",
+            data_loader,
+            desc="Evaluating",
             leave=False,
             unit="batch",
             disable=not tqdm_able,
         ) as pbar:
             for x, y, mask in pbar:
                 x = x.to(device)
-                y = y.to(device).unsqueeze(1)
+                y = y.to(device).unsqueeze(1).float()
                 mask = mask.to(device)
 
-                y_pred = net(x, mask)
+                logits = net(x, padding_mask=mask)
+                loss = loss_fn(logits, y)
 
-                loss = loss_fn(y_pred, y.to(torch.float32))
+                sample_count += x.size(0)
+                running_loss += loss.item() * x.size(0)
 
-                sample_count += x.shape[0]
-                running_loss += loss.item() * x.shape[0]
+                pred = (logits > 0.0).int()
+                y_int = y.int()
 
-                pred = (y_pred > 0.0).int()
-                TP += torch.sum((pred == 1) & (y == 1)).item()
-                FP += torch.sum((pred == 1) & (y == 0)).item()
-                TN += torch.sum((pred == 0) & (y == 0)).item()
-                FN += torch.sum((pred == 0) & (y == 1)).item()
+                TP += torch.sum((pred == 1) & (y_int == 1)).item()
+                FP += torch.sum((pred == 1) & (y_int == 0)).item()
+                TN += torch.sum((pred == 0) & (y_int == 0)).item()
+                FN += torch.sum((pred == 0) & (y_int == 1)).item()
 
-                l = running_loss / sample_count
-                precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-                recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-                f1_score = (
-                    2 * (precision * recall) / (precision + recall)
-                    if (precision + recall) > 0 else 0.0
-                )
-                accuracy = (TP + TN) / sample_count if sample_count > 0 else 0.0
+                logit_sum += logits.detach().sum().item()
+                logit_sq_sum += (logits.detach() ** 2).sum().item()
+                prob_sum += torch.sigmoid(logits.detach()).sum().item()
 
+                live_stats = summarize_binary_counts(TP, FP, TN, FN)
                 pbar.set_postfix(
                     {
-                        "loss": l,
-                        "acc": accuracy,
-                        "precision": precision,
-                        "recall": recall,
-                        "f1": f1_score,
+                        "loss": running_loss / sample_count,
+                        "bal_acc": live_stats["balanced_acc"],
+                        "pred_pos": live_stats["pred_pos_rate"],
+                        "f1": live_stats["f1"],
                     }
                 )
 
-    l = running_loss / sample_count
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-    recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-    f1_score = (
-        2 * (precision * recall) / (precision + recall)
-        if (precision + recall) > 0 else 0.0
-    )
-    accuracy = (TP + TN) / sample_count if sample_count > 0 else 0.0
+    stats = summarize_binary_counts(TP, FP, TN, FN)
+    logit_mean = logit_sum / max(1, sample_count)
+    logit_var = max(0.0, logit_sq_sum / max(1, sample_count) - logit_mean ** 2)
+
     return {
-        "loss": l,
-        "acc": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1_score,
+        "loss": running_loss / sample_count,
+        "logit_mean": logit_mean,
+        "logit_std": math.sqrt(logit_var),
+        "prob_mean": prob_sum / max(1, sample_count),
+        **stats,
     }
 
 
@@ -490,41 +514,45 @@ def main():
 
     train_cfg = get_dataset_train_cfg(args)
 
-    if "epochs" in train_cfg:
-        args.epochs = int(train_cfg["epochs"])
-    else:
-        args.epochs = int(args.epochs)
-
-    if "learning_rate" in train_cfg:
-        args.learning_rate = float(train_cfg["learning_rate"])
-    else:
-        args.learning_rate = float(args.learning_rate)
-
+    args.epochs = int(train_cfg.get("epochs", args.epochs))
+    args.learning_rate = float(train_cfg.get("learning_rate", args.learning_rate))
     args.batch_size = int(args.batch_size)
 
     last_best_ckpt_path = None
 
-    for i_iter in range(3):
+    for i_iter in range(1):
         history = {
             "train_loss": [],
             "train_acc": [],
-            "train_loss_s": [],
-            "train_loss_c": [],
-            "train_loss_mil": [],
-            "train_loss_comp_aux": [],
-            "gate_a_mean": [],
-            "gate_a_keep": [],
-            "gate_v_mean": [],
-            "gate_v_keep": [],
+            "train_loss_cls": [],
+            "train_loss_struct": [],
+            "train_loss_neg": [],
+            "train_loss_budget": [],
+            "train_loss_tv": [],
+            "train_loss_comp": [],
+            "train_lambda_struct": [],
+            "train_precision": [],
+            "train_recall": [],
+            "train_specificity": [],
+            "train_balanced_acc": [],
+            "train_f1": [],
+            "train_pred_pos_rate": [],
+            "train_logit_mean": [],
+            "train_logit_std": [],
             "val_loss": [],
             "val_acc": [],
             "val_precision": [],
             "val_recall": [],
+            "val_specificity": [],
+            "val_balanced_acc": [],
             "val_f1": [],
+            "val_pred_pos_rate": [],
+            "val_logit_mean": [],
+            "val_logit_std": [],
         }
 
         if args.if_wandb:
-            wandb_run_name = f"{args.model}-{args.train_gender}-{args.test_gender}"
+            wandb_run_name = f"{args.model}-{args.dataset}-{args.train_gender}-{args.test_gender}"
             wandb.init(project="mamnba_ad", config=args, name=wandb_run_name)
             args = wandb.config
 
@@ -535,70 +563,55 @@ def main():
         os.makedirs(f"{run_dir}/samples", exist_ok=True)
         os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
 
-        # ===== construct model =====
         if args.model == "DepMamba":
-            if args.dataset == "lmvd":
-                student_cfg = dict(args.mmmamba_lmvd)
-            elif args.dataset == "dvlog":
-                student_cfg = dict(args.mmmamba)
-            else:
-                raise ValueError(f"Unknown dataset {args.dataset}")
-
+            student_cfg = get_model_cfg(args)
             student_cfg = sanitize_depmamba_cfg(student_cfg)
             net = DepMamba(**student_cfg)
         else:
             raise NotImplementedError(
                 f"The {args.model} method has not been implemented by this repo"
             )
-        
-        train_cfg = get_dataset_train_cfg(args)
-
-        lambda_mil_peak = float(train_cfg.get("lambda_mil_peak", 0.10))
-        lambda_comp_peak = float(train_cfg.get("lambda_comp_peak", 0.02))
 
         net = net.to(args.device[0])
         if len(args.device) > 1:
             net = torch.nn.DataParallel(net, device_ids=args.device)
-        
-        core_net = get_core_model(net) if isinstance(net, torch.nn.DataParallel) else net
-        core_net.lambda_mil_peak = lambda_mil_peak
-        core_net.lambda_comp_peak = lambda_comp_peak
 
-        # ===== prepare data =====
-        if args.dataset == "dvlog":
-            train_loader = get_dvlog_dataloader(
-                args.data_dir, "train", args.batch_size, args.train_gender
-            )
-            val_loader = get_dvlog_dataloader(
-                args.data_dir, "valid", args.batch_size, args.test_gender
-            )
-            test_loader = get_dvlog_dataloader(
-                args.data_dir, "test", args.batch_size, args.test_gender
-            )
-        elif args.dataset == "lmvd":
-            train_loader = get_lmvd_dataloader(
-                args.data_dir, "train", args.batch_size, args.train_gender
-            )
-            val_loader = get_lmvd_dataloader(
-                args.data_dir, "valid", args.batch_size, args.test_gender
-            )
-            test_loader = get_lmvd_dataloader(
-                args.data_dir, "test", args.batch_size, args.test_gender
-            )
-        else:
-            raise ValueError(f"Unknown dataset {args.dataset}")
+        train_loader, val_loader, test_loader = build_dataloaders(args)
+
+        if bool(train_cfg.get("debug_overfit_small", False)):
+            overfit_pos = int(train_cfg.get("overfit_pos", 8))
+            overfit_neg = int(train_cfg.get("overfit_neg", 8))
+            train_loader = make_balanced_subset_loader(train_loader, pos_count=overfit_pos, neg_count=overfit_neg, shuffle=True)
+            val_loader = make_balanced_subset_loader(train_loader, pos_count=overfit_pos, neg_count=overfit_neg, shuffle=False)
+            test_loader = val_loader
+            print(f"[DEBUG] balanced overfit subset enabled: pos={overfit_pos}, neg={overfit_neg}, total={overfit_pos + overfit_neg}")
+
+        base_pos = evaluate_constant_baseline(val_loader, predict_positive=True)
+        base_neg = evaluate_constant_baseline(val_loader, predict_positive=False)
+        print("[Val baseline | all positive]", base_pos)
+        print("[Val baseline | all negative]", base_neg)
 
         loss_fn = torch.nn.BCEWithLogitsLoss()
-        train_cfg = get_dataset_train_cfg(args)
         weight_decay = float(train_cfg.get("weight_decay", 0.0))
 
-        optimizer = torch.optim.Adam(
+        optimizer = torch.optim.AdamW(
             net.parameters(),
             lr=args.learning_rate,
             weight_decay=weight_decay,
         )
 
-        best_val_acc = -1.0
+        struct_cfg = {
+            "lambda_struct_peak": float(train_cfg.get("lambda_struct_peak", 0.3)),
+            "budget_rho": float(train_cfg.get("budget_rho", 0.25)),
+            "comp_margin": float(train_cfg.get("comp_margin", 0.15)),
+            "comp_topk_ratio": float(train_cfg.get("comp_topk_ratio", 0.1)),
+            "lambda_neg": float(train_cfg.get("lambda_neg", 1.0)),
+            "lambda_budget": float(train_cfg.get("lambda_budget", 1.0)),
+            "lambda_tv": float(train_cfg.get("lambda_tv", 0.2)),
+            "lambda_comp": float(train_cfg.get("lambda_comp", 0.5)),
+        }
+
+        best_val_metric = -1.0
 
         if args.train:
             for epoch in range(args.epochs):
@@ -611,62 +624,100 @@ def main():
                     epoch,
                     args.epochs,
                     args.tqdm_able,
+                    struct_cfg,
                 )
-                val_results = val(net, val_loader, loss_fn, args.device[0], args.tqdm_able)
+                val_results = evaluate(net, val_loader, loss_fn, args.device[0], args.tqdm_able)
+
                 print(
                     f"[Epoch {epoch:03d}] "
                     f"train_loss={train_results['loss']:.4f}, "
                     f"train_acc={train_results['acc']:.4f}, "
+                    f"train_bal_acc={train_results['balanced_acc']:.4f}, "
+                    f"train_pred_pos={train_results['pred_pos_rate']:.4f}, "
+                    f"train_cls={train_results['loss_cls']:.4f}, "
+                    f"train_struct={train_results['loss_struct']:.4f}, "
                     f"val_loss={val_results['loss']:.4f}, "
                     f"val_acc={val_results['acc']:.4f}, "
-                    f"val_f1={val_results['f1']:.4f}"
+                    f"val_bal_acc={val_results['balanced_acc']:.4f}, "
+                    f"val_f1={val_results['f1']:.4f}, "
+                    f"val_pred_pos={val_results['pred_pos_rate']:.4f}, "
+                    f"TP={val_results['TP']}, FP={val_results['FP']}, TN={val_results['TN']}, FN={val_results['FN']}"
                 )
 
                 history["train_loss"].append(float(train_results["loss"]))
                 history["train_acc"].append(float(train_results["acc"]))
-                history["train_loss_s"].append(float(train_results["loss_s"]))
-                history["train_loss_c"].append(float(train_results["loss_c"]))
-                history["train_loss_mil"].append(float(train_results["loss_mil"]))
-                history["train_loss_comp_aux"].append(float(train_results["loss_comp_aux"]))
-                history["gate_a_mean"].append(float(train_results["gate_a_mean"]))
-                history["gate_a_keep"].append(float(train_results["gate_a_keep"]))
-                history["gate_v_mean"].append(float(train_results["gate_v_mean"]))
-                history["gate_v_keep"].append(float(train_results["gate_v_keep"]))
+                history["train_loss_cls"].append(float(train_results["loss_cls"]))
+                history["train_loss_struct"].append(float(train_results["loss_struct"]))
+                history["train_loss_neg"].append(float(train_results["loss_neg"]))
+                history["train_loss_budget"].append(float(train_results["loss_budget"]))
+                history["train_loss_tv"].append(float(train_results["loss_tv"]))
+                history["train_loss_comp"].append(float(train_results["loss_comp"]))
+                history["train_lambda_struct"].append(float(train_results["lambda_struct"]))
+                history["train_precision"].append(float(train_results["precision"]))
+                history["train_recall"].append(float(train_results["recall"]))
+                history["train_specificity"].append(float(train_results["specificity"]))
+                history["train_balanced_acc"].append(float(train_results["balanced_acc"]))
+                history["train_f1"].append(float(train_results["f1"]))
+                history["train_pred_pos_rate"].append(float(train_results["pred_pos_rate"]))
+                history["train_logit_mean"].append(float(train_results["logit_mean"]))
+                history["train_logit_std"].append(float(train_results["logit_std"]))
 
                 history["val_loss"].append(float(val_results["loss"]))
                 history["val_acc"].append(float(val_results["acc"]))
                 history["val_precision"].append(float(val_results["precision"]))
                 history["val_recall"].append(float(val_results["recall"]))
+                history["val_specificity"].append(float(val_results["specificity"]))
+                history["val_balanced_acc"].append(float(val_results["balanced_acc"]))
                 history["val_f1"].append(float(val_results["f1"]))
+                history["val_pred_pos_rate"].append(float(val_results["pred_pos_rate"]))
+                history["val_logit_mean"].append(float(val_results["logit_mean"]))
+                history["val_logit_std"].append(float(val_results["logit_std"]))
 
-                val_metric = val_results["f1"]
+                val_metric = val_results["balanced_acc"]
 
-                if val_metric > best_val_acc:
-                    best_val_acc = val_metric
+                if val_metric > best_val_metric:
+                    best_val_metric = val_metric
                     best_ckpt_path = f"{run_dir}/checkpoints/best_model.pt"
                     torch.save(get_core_model(net).state_dict(), best_ckpt_path)
                     last_best_ckpt_path = best_ckpt_path
+                    print(
+                        f"[Best updated] epoch={epoch:03d}, "
+                        f"val_bal_acc={val_results['balanced_acc']:.4f}, "
+                        f"val_f1={val_results['f1']:.4f}"
+                    )
 
                 if args.if_wandb:
                     wandb.log(
                         {
                             "loss/train": train_results["loss"],
                             "acc/train": train_results["acc"],
-                            "loss/train_s": train_results["loss_s"],
-                            "loss/train_c": train_results["loss_c"],
-                            "gate/audio_mean": train_results["gate_a_mean"],
-                            "gate/audio_keep": train_results["gate_a_keep"],
-                            "gate/video_mean": train_results["gate_v_mean"],
-                            "gate/video_keep": train_results["gate_v_keep"],
+                            "loss/train_cls": train_results["loss_cls"],
+                            "loss/train_struct": train_results["loss_struct"],
+                            "loss/train_neg": train_results["loss_neg"],
+                            "loss/train_budget": train_results["loss_budget"],
+                            "loss/train_tv": train_results["loss_tv"],
+                            "loss/train_comp": train_results["loss_comp"],
+                            "lambda/train_struct": train_results["lambda_struct"],
+                            "precision/train": train_results["precision"],
+                            "recall/train": train_results["recall"],
+                            "specificity/train": train_results["specificity"],
+                            "balanced_acc/train": train_results["balanced_acc"],
+                            "pred_pos_rate/train": train_results["pred_pos_rate"],
+                            "logit_mean/train": train_results["logit_mean"],
+                            "logit_std/train": train_results["logit_std"],
                             "loss/val": val_results["loss"],
                             "acc/val": val_results["acc"],
                             "precision/val": val_results["precision"],
                             "recall/val": val_results["recall"],
+                            "specificity/val": val_results["specificity"],
+                            "balanced_acc/val": val_results["balanced_acc"],
                             "f1/val": val_results["f1"],
+                            "pred_pos_rate/val": val_results["pred_pos_rate"],
+                            "logit_mean/val": val_results["logit_mean"],
+                            "logit_std/val": val_results["logit_std"],
                         }
                     )
 
-        # ===== load best model for testing =====
         best_ckpt_path = f"{run_dir}/checkpoints/best_model.pt"
         if not os.path.exists(best_ckpt_path):
             raise FileNotFoundError(f"Best checkpoint not found: {best_ckpt_path}")
@@ -676,12 +727,12 @@ def main():
         core_net.eval()
 
         with torch.no_grad():
-            test_results = val(net, test_loader, loss_fn, args.device[0], args.tqdm_able)
+            test_results = evaluate(net, test_loader, loss_fn, args.device[0], args.tqdm_able)
             print("Test results:")
             print(test_results)
 
             avg_score = (
-                test_results["acc"]
+                test_results["balanced_acc"]
                 + test_results["precision"]
                 + test_results["recall"]
                 + test_results["f1"]
@@ -692,6 +743,7 @@ def main():
             with open(results_path, "w") as f:
                 test_result_str = (
                     f'Accuracy:{test_results["acc"]}, '
+                    f'BalancedAcc:{test_results["balanced_acc"]}, '
                     f'Precision:{test_results["precision"]}, '
                     f'Recall:{test_results["recall"]}, '
                     f'F1:{test_results["f1"]}, '
@@ -709,7 +761,6 @@ def main():
             artifact = wandb.Artifact("best_model", type="model")
             artifact.add_file(last_best_ckpt_path)
             wandb.log_artifact(artifact)
-
         wandb.finish()
 
 
